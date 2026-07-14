@@ -131,7 +131,28 @@ function vertexNormalsFromPositions(posAttr) {
   return normals;
 }
 
-const PLANET_DETAIL = 15; // icosahedron subdivision (faces = 20*(detail+1)^2) — smooth silhouette
+// icosahedron subdivision (faces = 20*(detail+1)^2). Fragment boundaries follow
+// individual triangle edges, so this also sets how "toothy" a split seam looks —
+// detail 15 was ~4.3° per tooth (visibly jagged when exploded); 60 is ~1.1°.
+const PLANET_DETAIL = 60;
+
+// IcosahedronGeometry + mergeVertices is expensive (the dominant cost of a planet
+// rebuild) but topology-only — every planet uses the same detail level, and R just
+// scales it. Build the indexed unit sphere once and reuse its index/directions for
+// every planet, scaling positions by R per-build instead of re-deriving them.
+let _unitSphereCache = null;
+function getUnitSphere() {
+  if (_unitSphereCache) return _unitSphereCache;
+  const merged = mergeVertices(new THREE.IcosahedronGeometry(1, PLANET_DETAIL));
+  const pos = merged.attributes.position;
+  const vCount = pos.count;
+  const dirs = new Float32Array(vCount * 3);
+  for (let i = 0; i < dirs.length; i++) dirs[i] = pos.array[i]; // already unit length (R=1)
+  const index = merged.index.array.slice(); // plain typed array, topology only
+  merged.dispose();
+  _unitSphereCache = { dirs, index, vCount, faceCount: index.length / 3 };
+  return _unitSphereCache;
+}
 
 /* ---------------- textures ---------------- */
 function glowTexture(rgb = "160,190,255") {
@@ -234,31 +255,30 @@ function buildPlanetRecord(project, pos) {
     spin.add(core);
     chunks.push({ mesh: core, dir: new THREE.Vector3(0, 1, 0), task: null, isCore: true });
   } else {
-    // build one indexed, smooth-normal sphere, then bucket its FACES by nearest
-    // task seed — each fragment keeps a slice of the shared vertex data, so
-    // lighting/color stay continuous across fragment seams when reassembled.
+    // build off the shared unit-sphere topology (see getUnitSphere), scaled by R,
+    // then bucket its FACES by nearest task seed — each fragment keeps a slice of
+    // the shared vertex data, so lighting/color stay continuous across fragment
+    // seams when reassembled.
     const seeds = fibSphere(doneTasks.length);
-    const base = mergeVertices(new THREE.IcosahedronGeometry(R, PLANET_DETAIL));
-    const basePos = base.attributes.position;
-    const baseIndex = base.index;
-    const vCount = basePos.count;
-    const baseNormals = vertexNormalsFromPositions(basePos);
+    const unit = getUnitSphere();
+    const vCount = unit.vCount;
     const baseColors = new Float32Array(vCount * 3);
-    const dirs = new Array(vCount);
     const vTmp = new THREE.Vector3();
     for (let i = 0; i < vCount; i++) {
-      vTmp.set(baseNormals[i * 3], baseNormals[i * 3 + 1], baseNormals[i * 3 + 2]);
-      dirs[i] = vTmp.clone();
+      vTmp.set(unit.dirs[i * 3], unit.dirs[i * 3 + 1], unit.dirs[i * 3 + 2]);
       const col = terrainColor(vTmp);
       baseColors[i * 3] = col.r; baseColors[i * 3 + 1] = col.g; baseColors[i * 3 + 2] = col.b;
     }
 
     const buckets = seeds.map(() => ({ map: new Map(), positions: [], normalsArr: [], colorsArr: [], indices: [] }));
     const cen = new THREE.Vector3();
-    const faceCount = baseIndex.count / 3;
-    for (let f = 0; f < faceCount; f++) {
-      const i0 = baseIndex.getX(f * 3), i1 = baseIndex.getX(f * 3 + 1), i2 = baseIndex.getX(f * 3 + 2);
-      cen.copy(dirs[i0]).add(dirs[i1]).add(dirs[i2]).normalize();
+    const d0 = new THREE.Vector3(), d1 = new THREE.Vector3(), d2 = new THREE.Vector3();
+    for (let f = 0; f < unit.faceCount; f++) {
+      const i0 = unit.index[f * 3], i1 = unit.index[f * 3 + 1], i2 = unit.index[f * 3 + 2];
+      d0.set(unit.dirs[i0 * 3], unit.dirs[i0 * 3 + 1], unit.dirs[i0 * 3 + 2]);
+      d1.set(unit.dirs[i1 * 3], unit.dirs[i1 * 3 + 1], unit.dirs[i1 * 3 + 2]);
+      d2.set(unit.dirs[i2 * 3], unit.dirs[i2 * 3 + 1], unit.dirs[i2 * 3 + 2]);
+      cen.copy(d0).add(d1).add(d2).normalize();
       let best = 0, bd = -Infinity;
       for (let s = 0; s < seeds.length; s++) {
         const d = cen.dot(seeds[s]);
@@ -270,15 +290,14 @@ function buildPlanetRecord(project, pos) {
         if (li === undefined) {
           li = b.positions.length / 3;
           b.map.set(orig, li);
-          b.positions.push(basePos.getX(orig), basePos.getY(orig), basePos.getZ(orig));
-          b.normalsArr.push(baseNormals[orig * 3], baseNormals[orig * 3 + 1], baseNormals[orig * 3 + 2]);
+          b.positions.push(unit.dirs[orig * 3] * R, unit.dirs[orig * 3 + 1] * R, unit.dirs[orig * 3 + 2] * R);
+          b.normalsArr.push(unit.dirs[orig * 3], unit.dirs[orig * 3 + 1], unit.dirs[orig * 3 + 2]);
           b.colorsArr.push(baseColors[orig * 3], baseColors[orig * 3 + 1], baseColors[orig * 3 + 2]);
         }
         return li;
       });
       b.indices.push(tri[0], tri[1], tri[2]);
     }
-    base.dispose();
 
     seeds.forEach((dir, i) => {
       const b = buckets[i];
