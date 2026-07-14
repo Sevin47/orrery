@@ -32,7 +32,7 @@ function layoutPos(i) {
   if (i === 0) return new THREE.Vector3(0, 0, 0);
   const ga = 2.39996;
   const a = i * ga;
-  const r = 9 + i * 5.2;
+  const r = 10 + i * 6.4; // wider spacing — mature planets now grow considerably larger
   return new THREE.Vector3(Math.cos(a) * r, Math.sin(i * 1.93) * 3.2, Math.sin(a) * r);
 }
 function paletteFor(project) {
@@ -47,7 +47,12 @@ function paletteFor(project) {
 }
 function radiusFor(project) {
   const done = project.tasks.filter((t) => t.done).length;
-  return 1.15 + Math.min(2.4, done * 0.14 + project.tasks.length * 0.04);
+  const total = project.tasks.length;
+  // power-curve growth so magnitude reads clearly across small projects while
+  // still tapering off (sqrt-ish) for very large ones, rather than plateauing
+  // almost immediately like the old linear-capped version did.
+  const growth = Math.pow(done, 0.62) * 0.85 + Math.log1p(total) * 0.12;
+  return 1.0 + Math.min(4.6, growth);
 }
 function signature(p) {
   return p.id + "|" + p.tasks.map((t) => t.id + (t.done ? "1" : "0")).join(",");
@@ -297,23 +302,30 @@ function buildPlanetRecord(project, pos) {
     group.add(ring);
   }
 
-  // stardust clusters for open tasks
+  // stardust clusters for open tasks — soft round cloud-puffs, not hard squares
   const dust = [];
+  const dustMap = glowTexture(`${Math.round(pal.accent.r * 255)},${Math.round(pal.accent.g * 255)},${Math.round(pal.accent.b * 255)}`);
   openTasks.forEach((task, i) => {
     const trng = mulberry32(strHash(task.id));
-    const count = 64;
+    const count = 72;
     const arr = new Float32Array(count * 3);
+    const colArr = new Float32Array(count * 3);
     for (let k = 0; k < count; k++) {
       const rr = Math.pow(trng(), 0.6) * 0.42;
       const th = trng() * Math.PI * 2, ph = Math.acos(2 * trng() - 1);
       arr[k * 3] = rr * Math.sin(ph) * Math.cos(th);
       arr[k * 3 + 1] = rr * Math.cos(ph) * 0.7;
       arr[k * 3 + 2] = rr * Math.sin(ph) * Math.sin(th);
+      const jitter = 0.7 + trng() * 0.55; // uneven brightness — reads as wispy dust, not a uniform blob
+      colArr[k * 3] = pal.accent.r * jitter;
+      colArr[k * 3 + 1] = pal.accent.g * jitter;
+      colArr[k * 3 + 2] = pal.accent.b * jitter;
     }
     const pg = new THREE.BufferGeometry();
     pg.setAttribute("position", new THREE.BufferAttribute(arr, 3));
+    pg.setAttribute("color", new THREE.Float32BufferAttribute(colArr, 3));
     const pm = new THREE.PointsMaterial({
-      color: pal.accent, size: 0.09, transparent: true, opacity: 0.95,
+      map: dustMap, vertexColors: true, size: 0.24, transparent: true, opacity: 0.85,
       blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true,
     });
     const points = new THREE.Points(pg, pm);
