@@ -40,20 +40,21 @@ function fibSphere(n) {
 // click hit-sphere, or halos/rings wash into each other at large sizes.
 const PLANET_VISUAL_SPREAD = 2.6;
 
+// The central star every project-planet orbits. One system for now; a later
+// pass may split projects by year into their own solar systems under a wider
+// galaxy view, at which point this becomes per-system rather than singular.
+const STAR_RADIUS = 9;
+const STAR_CLEARANCE = STAR_RADIUS * PLANET_VISUAL_SPREAD + 10; // keep planet 0 clear of the star's own glow
+
 function computeLayout(projects) {
   const ga = 2.39996;
   const positions = [];
-  let orbitR = 0;
+  let orbitR = STAR_CLEARANCE; // every planet orbits the central star — none sit at the origin anymore
   let prevR = 0;
   for (let i = 0; i < projects.length; i++) {
     const R = radiusFor(projects[i]);
-    if (i === 0) {
-      positions.push(new THREE.Vector3(0, 0, 0));
-      prevR = R;
-      continue;
-    }
     const gap = 8; // flat breathing room on top of the size-scaled clearance below
-    orbitR = Math.max(orbitR + (prevR + R) * PLANET_VISUAL_SPREAD + gap, 18);
+    orbitR = orbitR + (prevR + R) * PLANET_VISUAL_SPREAD + gap;
     const a = i * ga;
     const y = Math.sin(i * 0.27 + 0.6) * (2.6 + R * 0.35);
     positions.push(new THREE.Vector3(Math.cos(a) * orbitR, y, Math.sin(a) * orbitR));
@@ -628,12 +629,28 @@ export default function Orrery() {
     mount.appendChild(renderer.domElement);
 
     scene.add(new THREE.AmbientLight(0x30395c, 1.1));
-    const sun = new THREE.DirectionalLight(0xdfe8ff, 1.15);
-    sun.position.set(30, 40, 20);
-    scene.add(sun);
     const rim = new THREE.PointLight(0x6a7dff, 0.5, 200);
     rim.position.set(-40, -10, -30);
     scene.add(rim);
+
+    // the star every project-planet orbits — self-lit (MeshBasicMaterial ignores
+    // scene lights, appropriate for something that IS the light source), warm
+    // and bright on purpose as the one non-cool object in the palette, and the
+    // actual light planets are lit by (a point light replaces the old fixed
+    // "sun" directional light now that there's a real object to hang it off of).
+    const sunGeo = new THREE.IcosahedronGeometry(STAR_RADIUS, 24);
+    const sunMat = new THREE.MeshBasicMaterial({ color: new THREE.Color().setHSL(0.11, 0.85, 0.74) });
+    const sunMesh = new THREE.Mesh(sunGeo, sunMat);
+    scene.add(sunMesh);
+    const sunGlow = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glowTexture("255,238,210"),
+      transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false,
+    }));
+    sunGlow.scale.set(STAR_RADIUS * 6, STAR_RADIUS * 6, 1);
+    scene.add(sunGlow);
+    const sunLight = new THREE.PointLight(0xfff2df, 2.4, 0, 1.15);
+    sunLight.position.set(0, 0, 0);
+    scene.add(sunLight);
 
     // starfield
     const starGeo = new THREE.BufferGeometry();
@@ -705,6 +722,9 @@ export default function Orrery() {
       const motion = reducedMotion.current ? 0.25 : 1;
 
       stars.rotation.y += dt * 0.004 * motion;
+      const sunPulse = 1 + Math.sin(t * 0.9) * 0.03 * motion;
+      sunMesh.scale.setScalar(sunPulse);
+      sunGlow.material.opacity = 0.85 + Math.sin(t * 0.9) * 0.05 * motion;
 
       const v = viewRef.current;
       for (const [pid, rec] of world.planets) {
@@ -808,6 +828,8 @@ export default function Orrery() {
       window.removeEventListener("resize", onResize);
       for (const [, rec] of world.planets) disposeRecord(rec);
       starGeo.dispose();
+      sunGeo.dispose(); sunMat.dispose();
+      sunGlow.material.map.dispose(); sunGlow.material.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode === mount) mount.removeChild(renderer.domElement);
       worldRef.current = null;
@@ -827,7 +849,7 @@ export default function Orrery() {
       }
     }
     const positions = computeLayout(projects);
-    let outer = 20;
+    let outer = STAR_RADIUS * 4; // floor so the star itself always frames cleanly, even with 0-1 projects
     projects.forEach((p, i) => {
       const pos = positions[i];
       outer = Math.max(outer, pos.length() + radiusFor(p));
