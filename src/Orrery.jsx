@@ -59,6 +59,9 @@ function fmtDate(d) {
   const dt = new Date(d + "T00:00:00");
   return dt.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
+function clamp(v, a, b) {
+  return Math.max(a, Math.min(b, v));
+}
 
 /* ---------------- textures ---------------- */
 function glowTexture(rgb = "160,190,255") {
@@ -266,13 +269,19 @@ export default function Orrery() {
   const [indexOpen, setIndexOpen] = useState(false);
   const [soundOn, setSoundOn] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null);
+  const [confirmDeleteTask, setConfirmDeleteTask] = useState(null);
   const [saveNote, setSaveNote] = useState("");
   const viewRef = useRef(view);
   viewRef.current = view;
   const soundRef = useRef({ ready: false, synth: null, chime: null, timer: null });
+  const dragRef = useRef({ down: false, moved: false, startX: 0, startY: 0, startTheta: 0, startAlpha: 0 });
   const reducedMotion = useRef(
     typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
   );
+
+  useEffect(() => {
+    setConfirmDeleteTask(null);
+  }, [selected]);
 
   // form state
   const [fProjName, setFProjName] = useState("");
@@ -436,6 +445,7 @@ export default function Orrery() {
       raycaster: new THREE.Raycaster(),
       clock: new THREE.Clock(),
       hovered: null,
+      orbit: null, // {theta, alpha, dragging} — user-controlled rotation around focused planet
     };
     worldRef.current = world;
 
@@ -515,12 +525,36 @@ export default function Orrery() {
         }
       }
 
+      // orbit around the focused planet (user-controlled via drag)
+      if (v.mode === "planet" && world.orbit) {
+        const rec = world.planets.get(v.projectId);
+        if (rec) {
+          const baseHeight = rec.R * 0.9;
+          const baseDist = rec.R * 3.4 + 4.2;
+          const radius = Math.hypot(baseHeight, baseDist);
+          const alpha = world.orbit.alpha;
+          const theta = world.orbit.theta;
+          const horizontalDist = radius * Math.cos(alpha);
+          const p = rec.group.position;
+          world.camTarget.set(
+            p.x + horizontalDist * Math.sin(theta),
+            p.y + radius * Math.sin(alpha),
+            p.z + horizontalDist * Math.cos(theta)
+          );
+          world.lookTarget.copy(p);
+        }
+      }
+
       // camera glide
       const drift = (v.mode === "galaxy" && !reducedMotion.current) ? 1 : 0;
       const px = world.mouse.x * 3 * drift, py = world.mouse.y * 1.6 * drift;
-      world.camPos.lerp(new THREE.Vector3(
-        world.camTarget.x + px, world.camTarget.y - py, world.camTarget.z
-      ), Math.min(1, dt * 2.2));
+      if (v.mode === "planet" && world.orbit?.dragging) {
+        world.camPos.set(world.camTarget.x, world.camTarget.y, world.camTarget.z);
+      } else {
+        world.camPos.lerp(new THREE.Vector3(
+          world.camTarget.x + px, world.camTarget.y - py, world.camTarget.z
+        ), Math.min(1, dt * 2.2));
+      }
       camera.position.copy(world.camPos);
       world.look.lerp(world.lookTarget, Math.min(1, dt * 2.6));
       camera.lookAt(world.look);
@@ -576,7 +610,7 @@ export default function Orrery() {
     });
   }, [projects]);
 
-  /* ---------- camera targets ---------- */
+  /* ---------- camera targets (galaxy) ---------- */
   useEffect(() => {
     const world = worldRef.current;
     if (!world) return;
@@ -585,16 +619,23 @@ export default function Orrery() {
       const far = 30 + n * 6.5;
       world.camTarget.set(0, 12 + n * 1.5, Math.min(110, far));
       world.lookTarget.set(0, 0, 0);
-    } else {
-      const rec = world.planets.get(view.projectId);
-      if (rec) {
-        const p = rec.group.position;
-        const d = rec.R * 3.4 + 4.2;
-        world.camTarget.set(p.x, p.y + rec.R * 0.9, p.z + d);
-        world.lookTarget.copy(p);
-      }
     }
-  }, [view, projects]);
+  }, [view.mode, projects.length]);
+
+  /* ---------- orbit init on planet focus (drag-to-rotate state) ---------- */
+  useEffect(() => {
+    const world = worldRef.current;
+    if (!world) return;
+    if (view.mode === "planet") {
+      const rec = world.planets.get(view.projectId);
+      const R = rec ? rec.R : 1.5;
+      const baseHeight = R * 0.9;
+      const baseDist = R * 3.4 + 4.2;
+      world.orbit = { theta: 0, alpha: Math.atan2(baseHeight, baseDist), dragging: false };
+    } else {
+      world.orbit = null;
+    }
+  }, [view.mode, view.projectId]);
 
   /* ---------- pointer interaction ---------- */
   const pick = useCallback((clientX, clientY) => {
@@ -626,8 +667,7 @@ export default function Orrery() {
     return null;
   }, []);
 
-  const onCanvasClick = useCallback((e) => {
-    const hit = pick(e.clientX, e.clientY);
+  const selectFromHit = useCallback((hit) => {
     if (!hit) { setSelected(null); return; }
     if (hit.type === "planet") {
       setView({ mode: "planet", projectId: hit.projectId });
@@ -636,7 +676,35 @@ export default function Orrery() {
     } else {
       setSelected({ projectId: viewRef.current.projectId, taskId: hit.taskId });
     }
-  }, [pick]);
+  }, []);
+
+  const onCanvasPointerDown = useCallback((e) => {
+    const world = worldRef.current;
+    const drag = dragRef.current;
+    drag.down = true;
+    drag.moved = false;
+    drag.startX = e.clientX;
+    drag.startY = e.clientY;
+    if (world?.orbit) {
+      drag.startTheta = world.orbit.theta;
+      drag.startAlpha = world.orbit.alpha;
+    }
+    try { mountRef.current?.setPointerCapture?.(e.pointerId); } catch (err) { /* best-effort */ }
+  }, []);
+
+  const onCanvasPointerUp = useCallback((e) => {
+    const world = worldRef.current;
+    try { mountRef.current?.releasePointerCapture?.(e.pointerId); } catch (err) { /* best-effort */ }
+    const drag = dragRef.current;
+    drag.down = false;
+    if (world?.orbit) world.orbit.dragging = false;
+    if (!drag.moved) {
+      selectFromHit(pick(e.clientX, e.clientY));
+    }
+  }, [pick, selectFromHit]);
+
+  const ORBIT_SENSITIVITY = 0.006;
+  const ORBIT_ALPHA_LIMIT = 1.45;
 
   const onCanvasMove = useCallback((e) => {
     const world = worldRef.current;
@@ -645,8 +713,24 @@ export default function Orrery() {
     const rect = mount.getBoundingClientRect();
     world.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     world.mouse.y = ((e.clientY - rect.top) / rect.height) * 2 - 1;
+
+    const drag = dragRef.current;
+    if (drag.down) {
+      const dx = e.clientX - drag.startX;
+      const dy = e.clientY - drag.startY;
+      if (Math.abs(dx) > 4 || Math.abs(dy) > 4) drag.moved = true;
+      if (viewRef.current.mode === "planet" && world.orbit) {
+        world.orbit.dragging = true;
+        world.orbit.theta = drag.startTheta - dx * ORBIT_SENSITIVITY;
+        world.orbit.alpha = clamp(drag.startAlpha + dy * ORBIT_SENSITIVITY, -ORBIT_ALPHA_LIMIT, ORBIT_ALPHA_LIMIT);
+      }
+      mount.style.cursor = "grabbing";
+      setHoverTip(null);
+      return;
+    }
+
     const hit = pick(e.clientX, e.clientY);
-    mount.style.cursor = hit ? "pointer" : "default";
+    mount.style.cursor = hit ? "pointer" : (viewRef.current.mode === "planet" ? "grab" : "default");
     // hover glow on chunks
     for (const [, rec] of world.planets) {
       rec.chunks.forEach((c) => {
@@ -769,8 +853,9 @@ export default function Orrery() {
       <div
         ref={mountRef}
         className="canvas-mount"
-        onClick={onCanvasClick}
+        onPointerDown={onCanvasPointerDown}
         onPointerMove={onCanvasMove}
+        onPointerUp={onCanvasPointerUp}
       />
       {hoverTip && (
         <div className="tip" style={{ left: hoverTip.x + 14, top: hoverTip.y - 10 }}>
@@ -827,7 +912,7 @@ export default function Orrery() {
           <div className="ph-hint">
             {focusProject.tasks.length === 0
               ? "A newborn core. Add tasks to give it matter."
-              : "Tap a fragment to recall its work · tap orbiting stardust to view open tasks"}
+              : "Tap a fragment to recall its work · tap orbiting stardust to view open tasks · drag to rotate"}
           </div>
         </div>
       )}
@@ -858,7 +943,15 @@ export default function Orrery() {
                 Return to stardust
               </button>
             )}
-            <button className="ghost-btn dim" onClick={() => deleteTask(selected.projectId, selTask.id)}>Delete</button>
+            {confirmDeleteTask === selTask.id ? (
+              <span className="confirm">
+                Delete this task?
+                <button className="danger-btn sm" onClick={() => deleteTask(selected.projectId, selTask.id)}>Delete</button>
+                <button className="ghost-btn sm" onClick={() => setConfirmDeleteTask(null)}>Keep</button>
+              </span>
+            ) : (
+              <button className="ghost-btn dim" onClick={() => setConfirmDeleteTask(selTask.id)}>Delete</button>
+            )}
             <button className="ghost-btn dim" onClick={() => setSelected(null)}>Close</button>
           </div>
         </aside>
