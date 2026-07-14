@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import * as THREE from "three";
 import * as Tone from "tone";
+import { mergeVertices } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 
 /* ---------------- deterministic helpers ---------------- */
 function strHash(s) {
@@ -62,6 +63,51 @@ function fmtDate(d) {
 function clamp(v, a, b) {
   return Math.max(a, Math.min(b, v));
 }
+function smoothstep(e0, e1, x) {
+  const t = clamp((x - e0) / (e1 - e0), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+function randSphereDir(rng) {
+  const z = rng() * 2 - 1;
+  const th = rng() * Math.PI * 2;
+  const r = Math.sqrt(Math.max(0, 1 - z * z));
+  return new THREE.Vector3(r * Math.cos(th), z, r * Math.sin(th));
+}
+function makeNoiseAxes(rng, n, freqBase) {
+  const axes = [];
+  for (let i = 0; i < n; i++) {
+    axes.push({
+      ax: randSphereDir(rng),
+      freq: freqBase * (1 + i * 0.65 + rng() * 0.35),
+      phase: rng() * Math.PI * 2,
+      amp: 1 / (i + 1),
+    });
+  }
+  return axes;
+}
+// smooth, continuous, deterministic pseudo-noise on the unit sphere (sum of
+// phase-shifted sine waves over random great-circle axes — no seams, no grain)
+function sphereFBM(dir, axes) {
+  let sum = 0, norm = 0;
+  for (let i = 0; i < axes.length; i++) {
+    const a = axes[i];
+    sum += a.amp * Math.sin(dir.dot(a.ax) * a.freq * Math.PI + a.phase);
+    norm += a.amp;
+  }
+  return norm ? sum / norm : 0;
+}
+function vertexNormalsFromPositions(posAttr) {
+  const vCount = posAttr.count;
+  const normals = new Float32Array(vCount * 3);
+  const v = new THREE.Vector3();
+  for (let i = 0; i < vCount; i++) {
+    v.fromBufferAttribute(posAttr, i).normalize();
+    normals[i * 3] = v.x; normals[i * 3 + 1] = v.y; normals[i * 3 + 2] = v.z;
+  }
+  return normals;
+}
+
+const PLANET_DETAIL = 15; // icosahedron subdivision (faces = 20*(detail+1)^2) — smooth silhouette
 
 /* ---------------- textures ---------------- */
 function glowTexture(rgb = "160,190,255") {
@@ -94,70 +140,132 @@ function buildPlanetRecord(project, pos) {
   const bandPhase = rng() * Math.PI * 2;
   const banding = 2.5 + rng() * 3;
   const capSize = 0.72 + rng() * 0.16;
+  const continentAxes = makeNoiseAxes(rng, 5, 1.6);
+  const mountainAxes = makeNoiseAxes(rng, 3, 4.2);
+  const craterCount = 3 + Math.floor(rng() * 5);
+  const craters = [];
+  for (let i = 0; i < craterCount; i++) {
+    craters.push({ center: randSphereDir(rng), radius: 0.14 + rng() * 0.20 });
+  }
 
-  const faceColor = (cx, cy, cz) => {
-    const len = Math.sqrt(cx * cx + cy * cy + cz * cz) || 1;
-    const lat = Math.asin(cy / len);
-    const n = mulberry32(strHash(project.id + (cx * 7.1).toFixed(1) + (cy * 5.3).toFixed(1) + (cz * 3.7).toFixed(1)))();
-    const band = Math.sin(lat * banding + bandPhase + n * 1.4) * 0.5;
-    let hue = pal.hue + (n - 0.5) * 0.05;
-    let sat = pal.sat + band * 0.08;
-    let light = 0.40 + band * 0.10 + n * 0.10;
-    if (Math.abs(lat) > capSize * (Math.PI / 2)) { light += 0.28; sat *= 0.45; }
-    if (n > 0.86) { light += 0.14; } // scattered bright "cities of light"
+  // per-vertex terrain: smooth continents/oceans (sat+light, never hue into warm),
+  // sparse craters with a shadowed bowl + bright rim, latitude bands, polar caps,
+  // scattered "cities of light". dir must be a unit vector.
+  const terrainColor = (dir) => {
+    const lat = Math.asin(clamp(dir.y, -1, 1));
+    const continent = sphereFBM(dir, continentAxes); // ~[-1,1]
+    const mountain = sphereFBM(dir, mountainAxes);
+    const landAmt = smoothstep(-0.05, 0.25, continent);
+    const band = Math.sin(lat * banding + bandPhase) * 0.5;
+
+    let hue = pal.hue + (continent > 0 ? 0.012 : -0.014) + mountain * 0.006;
+    let sat = pal.sat + (continent > 0 ? -0.06 : 0.14) + band * 0.05;
+    let light = 0.32 + continent * 0.13 + mountain * landAmt * 0.09 + band * 0.07;
+
+    for (let i = 0; i < craters.length; i++) {
+      const c = craters[i];
+      const d = Math.acos(clamp(dir.dot(c.center), -1, 1)) / c.radius;
+      if (d < 1) {
+        light += -0.20 * (1 - smoothstep(0, 0.55, d)) + 0.18 * Math.exp(-Math.pow((d - 0.82) / 0.12, 2));
+        sat *= 0.9;
+      }
+    }
+
+    if (Math.abs(lat) > capSize * (Math.PI / 2)) { light += 0.26; sat *= 0.5; }
+
+    const sparkle = mulberry32(strHash(project.id + dir.x.toFixed(2) + dir.y.toFixed(2) + dir.z.toFixed(2)))();
+    if (continent > 0 && sparkle > 0.965) light += 0.16; // scattered "cities of light"
+
     const col = new THREE.Color();
-    col.setHSL(((hue % 1) + 1) % 1, Math.min(0.9, Math.max(0.15, sat)), Math.min(0.85, Math.max(0.12, light)));
+    col.setHSL(((hue % 1) + 1) % 1, clamp(sat, 0.15, 0.92), clamp(light, 0.08, 0.88));
     return col;
   };
 
   if (doneTasks.length === 0) {
-    // newborn molten core
+    // newborn molten core — smooth sphere with mottled lava-noise coloring
     const coreR = 0.85;
-    const geo = new THREE.IcosahedronGeometry(coreR, 2);
+    const geo = new THREE.IcosahedronGeometry(coreR, 8);
+    const posAttr = geo.attributes.position;
+    const vCount = posAttr.count;
+    const colors = new Float32Array(vCount * 3);
+    const lavaAxes = makeNoiseAxes(rng, 4, 2.4);
+    const baseCol = new THREE.Color().setHSL(pal.hue, 0.55, 0.30);
+    const hotCol = new THREE.Color().setHSL((pal.hue + 0.03) % 1, 0.85, 0.62);
+    const vTmp = new THREE.Vector3();
+    for (let i = 0; i < vCount; i++) {
+      vTmp.fromBufferAttribute(posAttr, i).normalize();
+      const t = smoothstep(-0.2, 0.6, sphereFBM(vTmp, lavaAxes));
+      const col = baseCol.clone().lerp(hotCol, t);
+      colors[i * 3] = col.r; colors[i * 3 + 1] = col.g; colors[i * 3 + 2] = col.b;
+    }
+    geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+    geo.setAttribute("normal", new THREE.Float32BufferAttribute(vertexNormalsFromPositions(posAttr), 3));
     const mat = new THREE.MeshStandardMaterial({
-      color: new THREE.Color().setHSL(pal.hue, 0.5, 0.28),
-      emissive: pal.glow, emissiveIntensity: 0.55,
-      roughness: 0.6, metalness: 0.15, flatShading: true,
+      vertexColors: true,
+      emissive: pal.glow, emissiveIntensity: 0.5,
+      roughness: 0.55, metalness: 0.12,
     });
     const core = new THREE.Mesh(geo, mat);
     core.userData.isCore = true;
     spin.add(core);
     chunks.push({ mesh: core, dir: new THREE.Vector3(0, 1, 0), task: null, isCore: true });
   } else {
+    // build one indexed, smooth-normal sphere, then bucket its FACES by nearest
+    // task seed — each fragment keeps a slice of the shared vertex data, so
+    // lighting/color stay continuous across fragment seams when reassembled.
     const seeds = fibSphere(doneTasks.length);
-    const base = new THREE.IcosahedronGeometry(R, 3);
-    const g = base.index ? base.toNonIndexed() : base;
-    const posAttr = g.attributes.position;
-    const buckets = seeds.map(() => ({ pos: [], col: [] }));
-    const va = new THREE.Vector3(), vb = new THREE.Vector3(), vc = new THREE.Vector3(), cen = new THREE.Vector3();
-    for (let f = 0; f < posAttr.count; f += 3) {
-      va.fromBufferAttribute(posAttr, f);
-      vb.fromBufferAttribute(posAttr, f + 1);
-      vc.fromBufferAttribute(posAttr, f + 2);
-      cen.copy(va).add(vb).add(vc).divideScalar(3);
+    const base = mergeVertices(new THREE.IcosahedronGeometry(R, PLANET_DETAIL));
+    const basePos = base.attributes.position;
+    const baseIndex = base.index;
+    const vCount = basePos.count;
+    const baseNormals = vertexNormalsFromPositions(basePos);
+    const baseColors = new Float32Array(vCount * 3);
+    const dirs = new Array(vCount);
+    const vTmp = new THREE.Vector3();
+    for (let i = 0; i < vCount; i++) {
+      vTmp.set(baseNormals[i * 3], baseNormals[i * 3 + 1], baseNormals[i * 3 + 2]);
+      dirs[i] = vTmp.clone();
+      const col = terrainColor(vTmp);
+      baseColors[i * 3] = col.r; baseColors[i * 3 + 1] = col.g; baseColors[i * 3 + 2] = col.b;
+    }
+
+    const buckets = seeds.map(() => ({ map: new Map(), positions: [], normalsArr: [], colorsArr: [], indices: [] }));
+    const cen = new THREE.Vector3();
+    const faceCount = baseIndex.count / 3;
+    for (let f = 0; f < faceCount; f++) {
+      const i0 = baseIndex.getX(f * 3), i1 = baseIndex.getX(f * 3 + 1), i2 = baseIndex.getX(f * 3 + 2);
+      cen.copy(dirs[i0]).add(dirs[i1]).add(dirs[i2]).normalize();
       let best = 0, bd = -Infinity;
-      const cn = cen.clone().normalize();
       for (let s = 0; s < seeds.length; s++) {
-        const d = cn.dot(seeds[s]);
+        const d = cen.dot(seeds[s]);
         if (d > bd) { bd = d; best = s; }
       }
-      const col = faceColor(cen.x, cen.y, cen.z);
       const b = buckets[best];
-      b.pos.push(va.x, va.y, va.z, vb.x, vb.y, vb.z, vc.x, vc.y, vc.z);
-      for (let k = 0; k < 3; k++) b.col.push(col.r, col.g, col.b);
+      const tri = [i0, i1, i2].map((orig) => {
+        let li = b.map.get(orig);
+        if (li === undefined) {
+          li = b.positions.length / 3;
+          b.map.set(orig, li);
+          b.positions.push(basePos.getX(orig), basePos.getY(orig), basePos.getZ(orig));
+          b.normalsArr.push(baseNormals[orig * 3], baseNormals[orig * 3 + 1], baseNormals[orig * 3 + 2]);
+          b.colorsArr.push(baseColors[orig * 3], baseColors[orig * 3 + 1], baseColors[orig * 3 + 2]);
+        }
+        return li;
+      });
+      b.indices.push(tri[0], tri[1], tri[2]);
     }
     base.dispose();
-    if (g !== base) g.dispose();
+
     seeds.forEach((dir, i) => {
       const b = buckets[i];
-      if (b.pos.length === 0) return;
+      if (b.indices.length === 0) return;
       const geo = new THREE.BufferGeometry();
-      geo.setAttribute("position", new THREE.Float32BufferAttribute(b.pos, 3));
-      geo.setAttribute("color", new THREE.Float32BufferAttribute(b.col, 3));
-      geo.computeVertexNormals();
+      geo.setAttribute("position", new THREE.Float32BufferAttribute(b.positions, 3));
+      geo.setAttribute("normal", new THREE.Float32BufferAttribute(b.normalsArr, 3));
+      geo.setAttribute("color", new THREE.Float32BufferAttribute(b.colorsArr, 3));
+      geo.setIndex(b.indices);
       const mat = new THREE.MeshStandardMaterial({
-        vertexColors: true, roughness: 0.82, metalness: 0.08,
-        flatShading: true, emissive: 0x000000,
+        vertexColors: true, roughness: 0.78, metalness: 0.06, emissive: 0x000000,
       });
       const mesh = new THREE.Mesh(geo, mat);
       mesh.userData.taskId = doneTasks[i] ? doneTasks[i].id : null;
