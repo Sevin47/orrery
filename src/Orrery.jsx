@@ -437,6 +437,8 @@ export default function Orrery() {
   const [saveNote, setSaveNote] = useState("");
   const viewRef = useRef(view);
   viewRef.current = view;
+  const intakeOpenRef = useRef(intakeOpen);
+  intakeOpenRef.current = intakeOpen;
   const soundRef = useRef({ ready: false, synth: null, chime: null, timer: null });
   const dragRef = useRef({ down: false, moved: false, startX: 0, startY: 0, startTheta: 0, startAlpha: 0 });
   const reducedMotion = useRef(
@@ -920,6 +922,29 @@ export default function Orrery() {
     }
   }, []);
 
+  /* ---------- arrow-key planet cycling ---------- */
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+      const tag = document.activeElement?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (intakeOpenRef.current) return;
+      const ps = projectsRef.current;
+      if (!ps.length) return;
+      e.preventDefault();
+      const v = viewRef.current;
+      const idx = v.mode === "planet" ? ps.findIndex((p) => p.id === v.projectId) : -1;
+      const nextIdx = e.key === "ArrowRight"
+        ? (idx === -1 ? 0 : (idx + 1) % ps.length)
+        : (idx === -1 ? ps.length - 1 : (idx - 1 + ps.length) % ps.length);
+      setView({ mode: "planet", projectId: ps[nextIdx].id });
+      setSelected(null);
+      setHoverTip(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   const onCanvasPointerDown = useCallback((e) => {
     const world = worldRef.current;
     const drag = dragRef.current;
@@ -1153,8 +1178,8 @@ export default function Orrery() {
           </div>
           <div className="ph-hint">
             {focusProject.tasks.length === 0
-              ? "A newborn core. Add tasks to give it matter."
-              : "Tap a fragment to recall its work · tap orbiting stardust to view open tasks · drag to rotate"}
+              ? "A newborn core. Add tasks to give it matter. · ← → to switch worlds"
+              : "Tap a fragment to recall its work · tap orbiting stardust to view open tasks · drag to rotate · ← → to switch worlds"}
           </div>
         </div>
       )}
