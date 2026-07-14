@@ -46,21 +46,33 @@ const PLANET_VISUAL_SPREAD = 2.6;
 const STAR_RADIUS = 9;
 const STAR_CLEARANCE = STAR_RADIUS * PLANET_VISUAL_SPREAD + 10; // keep planet 0 clear of the star's own glow
 
+// Inner planets revolve faster than outer ones (loosely Keplerian — period
+// grows with radius) but everything is slowed to a calm, ambient drift rather
+// than anything physically real: a full revolution takes many minutes even
+// for the innermost planet.
+const ORBIT_ANGULAR_K = 0.055;
+function orbitSpeedFor(radius) {
+  return ORBIT_ANGULAR_K / Math.sqrt(radius);
+}
+
+// Returns orbit descriptors {radius, y, phase} per project — the star-relative
+// circular path each planet's group.position is driven from every frame (see
+// the animate loop), rather than a one-time static position.
 function computeLayout(projects) {
   const ga = 2.39996;
-  const positions = [];
+  const orbits = [];
   let orbitR = STAR_CLEARANCE; // every planet orbits the central star — none sit at the origin anymore
   let prevR = 0;
   for (let i = 0; i < projects.length; i++) {
     const R = radiusFor(projects[i]);
     const gap = 8; // flat breathing room on top of the size-scaled clearance below
     orbitR = orbitR + (prevR + R) * PLANET_VISUAL_SPREAD + gap;
-    const a = i * ga;
     const y = Math.sin(i * 0.27 + 0.6) * (2.6 + R * 0.35);
-    positions.push(new THREE.Vector3(Math.cos(a) * orbitR, y, Math.sin(a) * orbitR));
+    const phase = i * ga;
+    orbits.push({ radius: orbitR, y, phase });
     prevR = R;
   }
-  return positions;
+  return orbits;
 }
 function paletteFor(project) {
   const h = strHash(project.id);
@@ -177,14 +189,18 @@ function glowTexture(rgb = "160,190,255") {
 }
 
 /* ---------------- planet construction ---------------- */
-function buildPlanetRecord(project, pos) {
+function buildPlanetRecord(project, orbit) {
   const pal = paletteFor(project);
   const rng = mulberry32(strHash(project.id));
   const R = radiusFor(project);
   const doneTasks = project.tasks.filter((t) => t.done);
   const openTasks = project.tasks.filter((t) => !t.done);
   const group = new THREE.Group();
-  group.position.copy(pos);
+  group.position.set(
+    Math.cos(orbit.phase) * orbit.radius,
+    orbit.y,
+    Math.sin(orbit.phase) * orbit.radius
+  );
   const spin = new THREE.Group();
   group.add(spin);
   const chunks = [];
@@ -405,6 +421,8 @@ function buildPlanetRecord(project, pos) {
     R, pal, sig: signature(p2s(project)),
     explode: 0, spinAngle: Math.random() * Math.PI * 2,
     spinSpeed: 0.05 + rng() * 0.05,
+    orbitRadius: orbit.radius, orbitY: orbit.y, orbitAngle: orbit.phase,
+    orbitSpeed: orbitSpeedFor(orbit.radius),
   };
 }
 function p2s(p) { return p; }
@@ -728,6 +746,12 @@ export default function Orrery() {
 
       const v = viewRef.current;
       for (const [pid, rec] of world.planets) {
+        rec.orbitAngle += dt * rec.orbitSpeed * motion;
+        rec.group.position.set(
+          Math.cos(rec.orbitAngle) * rec.orbitRadius,
+          rec.orbitY,
+          Math.sin(rec.orbitAngle) * rec.orbitRadius
+        );
         const focused = v.mode === "planet" && v.projectId === pid;
         const target = focused ? 1 : 0;
         rec.explode += (target - rec.explode) * Math.min(1, dt * 2.4);
@@ -848,29 +872,35 @@ export default function Orrery() {
         world.planets.delete(id);
       }
     }
-    const positions = computeLayout(projects);
+    const orbits = computeLayout(projects);
     let outer = STAR_RADIUS * 4; // floor so the star itself always frames cleanly, even with 0-1 projects
     projects.forEach((p, i) => {
-      const pos = positions[i];
-      outer = Math.max(outer, pos.length() + radiusFor(p));
+      const orbit = orbits[i];
+      outer = Math.max(outer, Math.hypot(orbit.radius, orbit.y) + radiusFor(p));
       const sig = signature(p);
       let rec = world.planets.get(p.id);
       if (rec && rec.sig !== sig) {
-        const explode = rec.explode, spinAngle = rec.spinAngle;
+        const explode = rec.explode, spinAngle = rec.spinAngle, orbitAngle = rec.orbitAngle;
         world.scene.remove(rec.group);
         disposeRecord(rec);
         rec = null;
-        const fresh = buildPlanetRecord(p, pos);
+        const fresh = buildPlanetRecord(p, orbit);
         fresh.explode = explode;
         fresh.spinAngle = spinAngle;
+        fresh.orbitAngle = orbitAngle; // keep revolving smoothly through a rebuild, don't snap back to phase
         world.scene.add(fresh.group);
         world.planets.set(p.id, fresh);
       } else if (!rec) {
-        const fresh = buildPlanetRecord(p, pos);
+        const fresh = buildPlanetRecord(p, orbit);
         world.scene.add(fresh.group);
         world.planets.set(p.id, fresh);
       } else {
-        rec.group.position.copy(pos);
+        // signature unchanged, but the layout may have shifted (e.g. an earlier
+        // planet resized) — adopt the new radius/y, keep the current angle so
+        // motion stays continuous instead of jumping.
+        rec.orbitRadius = orbit.radius;
+        rec.orbitY = orbit.y;
+        rec.orbitSpeed = orbitSpeedFor(orbit.radius);
       }
     });
     world.galaxyExtent = outer;
