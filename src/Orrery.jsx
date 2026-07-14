@@ -425,7 +425,7 @@ export default function Orrery() {
   const [intakeOpen, setIntakeOpen] = useState(false);
   const [intakeMode, setIntakeMode] = useState("project");
   const [indexOpen, setIndexOpen] = useState(false);
-  const [soundOn, setSoundOn] = useState(false);
+  const [soundMode, setSoundMode] = useState("off"); // "off" | "ambient" | "classical"
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [confirmDeleteTask, setConfirmDeleteTask] = useState(null);
   const [saveNote, setSaveNote] = useState("");
@@ -491,45 +491,116 @@ export default function Orrery() {
       }
     } catch (e) {}
   }, []);
-  const toggleSound = useCallback(async () => {
+
+  const stopAmbientLoop = useCallback(() => {
     const s = soundRef.current;
-    if (!s.ready) {
-      try {
-        await Tone.start();
-        const reverb = new Tone.Reverb({ decay: 14, wet: 0.6 }).toDestination();
-        const synth = new Tone.PolySynth(Tone.Synth, {
-          oscillator: { type: "sine" },
-          envelope: { attack: 3.5, decay: 2, sustain: 0.35, release: 7 },
-        }).connect(reverb);
-        synth.volume.value = -22;
-        const chimeSynth = new Tone.PolySynth(Tone.Synth, {
-          oscillator: { type: "triangle" },
-          envelope: { attack: 0.005, decay: 1.4, sustain: 0.05, release: 2.5 },
-        }).connect(reverb);
-        chimeSynth.volume.value = -14;
-        const scale = ["C3", "D3", "F3", "G3", "A3", "C4", "D4", "F4", "G4"];
-        s.timer = setInterval(() => {
-          if (!soundRef.current.on) return;
-          try {
-            const n = scale[Math.floor(Math.random() * scale.length)];
-            synth.triggerAttackRelease(n, "2n");
-            if (Math.random() < 0.35) {
-              const n2 = scale[Math.floor(Math.random() * scale.length)];
-              synth.triggerAttackRelease(n2, "2n", Tone.now() + 1.2);
-            }
-          } catch (e) {}
-        }, 5200);
-        s.synth = synth; s.chime = chimeSynth; s.reverb = reverb; s.ready = true;
-      } catch (e) { return; }
-    }
-    s.on = !s.on;
-    setSoundOn(s.on);
+    if (s.ambientTimer) { clearInterval(s.ambientTimer); s.ambientTimer = null; }
   }, []);
+  const startAmbientLoop = useCallback(() => {
+    const s = soundRef.current;
+    if (s.ambientTimer) return; // already running
+    const scale = ["C3", "D3", "F3", "G3", "A3", "C4", "D4", "F4", "G4"];
+    s.ambientTimer = setInterval(() => {
+      try {
+        const n = scale[Math.floor(Math.random() * scale.length)];
+        s.synth.triggerAttackRelease(n, "2n");
+        if (Math.random() < 0.35) {
+          const n2 = scale[Math.floor(Math.random() * scale.length)];
+          s.synth.triggerAttackRelease(n2, "2n", Tone.now() + 1.2);
+        }
+      } catch (e) {}
+    }, 5200);
+  }, []);
+
+  // "Flying"-inspired classical mode: a slow, sparsely bowed solo voice over a
+  // soft sustained drone — long tones with minimal movement, like a lone string
+  // instrument outdoors, rather than the ambient mode's plucked pentatonic bells.
+  const stopClassicalLoop = useCallback(() => {
+    const s = soundRef.current;
+    if (s.classicalTimer) { clearTimeout(s.classicalTimer); s.classicalTimer = null; }
+    if (s.droneOn) {
+      try { s.drone.triggerRelease(); } catch (e) {}
+      s.droneOn = false;
+    }
+  }, []);
+  const startClassicalLoop = useCallback(() => {
+    const s = soundRef.current;
+    if (s.classicalTimer) return; // already running
+    const scale = ["D3", "F3", "G3", "A3", "C4", "D4", "F4", "A4"]; // D dorian-ish, cello/bass range
+    if (!s.droneOn) {
+      try { s.drone.triggerAttack("D2"); s.droneOn = true; } catch (e) {}
+    }
+    const playPhrase = () => {
+      try {
+        const n = scale[Math.floor(Math.random() * scale.length)];
+        const dur = 3 + Math.random() * 3.5;
+        s.bow.triggerAttackRelease(n, dur);
+      } catch (e) {}
+      s.classicalTimer = setTimeout(playPhrase, 9000 + Math.random() * 9000);
+    };
+    playPhrase();
+  }, []);
+
+  const initAudio = useCallback(async () => {
+    const s = soundRef.current;
+    if (s.ready) return;
+    await Tone.start();
+    const reverb = new Tone.Reverb({ decay: 14, wet: 0.6 }).toDestination();
+    const synth = new Tone.PolySynth(Tone.Synth, {
+      oscillator: { type: "sine" },
+      envelope: { attack: 3.5, decay: 2, sustain: 0.35, release: 7 },
+    }).connect(reverb);
+    synth.volume.value = -22;
+    const chimeSynth = new Tone.PolySynth(Tone.Synth, {
+      oscillator: { type: "triangle" },
+      envelope: { attack: 0.005, decay: 1.4, sustain: 0.05, release: 2.5 },
+    }).connect(reverb);
+    chimeSynth.volume.value = -14;
+
+    const classicalReverb = new Tone.Reverb({ decay: 20, wet: 0.55 }).toDestination();
+    const bowFilter = new Tone.Filter({ type: "lowpass", frequency: 1000, Q: 0.5 }).connect(classicalReverb);
+    const bowVibrato = new Tone.Vibrato({ frequency: 3.6, depth: 0.06 }).connect(bowFilter);
+    const bowSynth = new Tone.Synth({
+      oscillator: { type: "fatsawtooth", count: 3, spread: 18 },
+      envelope: { attack: 3.2, decay: 1.4, sustain: 0.72, release: 6.5 },
+    }).connect(bowVibrato);
+    bowSynth.volume.value = -18;
+    const droneSynth = new Tone.Synth({
+      oscillator: { type: "sine" },
+      envelope: { attack: 4, decay: 0, sustain: 1, release: 5 },
+    }).connect(classicalReverb);
+    droneSynth.volume.value = -28;
+
+    s.synth = synth; s.chime = chimeSynth; s.reverb = reverb;
+    s.bow = bowSynth; s.drone = droneSynth;
+    s.classicalReverb = classicalReverb; s.bowFilter = bowFilter; s.bowVibrato = bowVibrato;
+    s.ready = true;
+  }, []);
+
+  const cycleSound = useCallback(async () => {
+    try { await initAudio(); } catch (e) { return; }
+    // side effects live here, not inside setSoundMode's updater — React 18
+    // StrictMode double-invokes functional updaters in dev, which was firing
+    // startClassicalLoop() twice in the same tick and crashing Tone's scheduler.
+    const order = ["off", "ambient", "classical"];
+    const next = order[(order.indexOf(soundMode) + 1) % order.length];
+    stopAmbientLoop();
+    stopClassicalLoop();
+    if (next === "ambient") startAmbientLoop();
+    else if (next === "classical") startClassicalLoop();
+    setSoundMode(next);
+  }, [soundMode, initAudio, stopAmbientLoop, stopClassicalLoop, startAmbientLoop, startClassicalLoop]);
+
   useEffect(() => () => {
     const s = soundRef.current;
-    if (s.timer) clearInterval(s.timer);
-    try { s.synth?.dispose(); s.chime?.dispose(); s.reverb?.dispose(); } catch (e) {}
-  }, []);
+    stopAmbientLoop();
+    stopClassicalLoop();
+    try {
+      s.synth?.dispose(); s.chime?.dispose(); s.reverb?.dispose();
+      s.bow?.dispose(); s.drone?.dispose();
+      s.classicalReverb?.dispose(); s.bowFilter?.dispose(); s.bowVibrato?.dispose();
+    } catch (e) {}
+  }, [stopAmbientLoop, stopClassicalLoop]);
 
   /* ---------- three.js world ---------- */
   useEffect(() => {
@@ -1157,8 +1228,8 @@ export default function Orrery() {
       {/* bottom controls */}
       <div className="hud bottom-right">
         {saveNote && <span className="save-note">{saveNote}</span>}
-        <button className="ghost-btn" onClick={toggleSound} aria-label="Toggle ambient sound">
-          {soundOn ? "♪ sound on" : "♪ sound off"}
+        <button className="ghost-btn" onClick={cycleSound} aria-label="Cycle ambient sound mode">
+          {soundMode === "off" ? "♪ sound off" : soundMode === "ambient" ? "♪ ambient hum" : "♪ soft strings"}
         </button>
         <button className="primary-btn" onClick={() => {
           setIntakeMode(projects.length ? "task" : "project");
