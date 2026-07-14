@@ -469,6 +469,8 @@ export default function Orrery() {
   const [intakeMode, setIntakeMode] = useState("project");
   const [indexOpen, setIndexOpen] = useState(false);
   const [debugOpen, setDebugOpen] = useState(false);
+  const [dbgCount, setDbgCount] = useState(10);
+  const [dbgConfirmClear, setDbgConfirmClear] = useState(false);
   const [, setDebugTick] = useState(0); // forces the debug panel to re-read live world/project data
   const [soundMode, setSoundMode] = useState("off"); // "off" | "ambient" | "classical"
   const [confirmDelete, setConfirmDelete] = useState(null);
@@ -1188,6 +1190,44 @@ export default function Orrery() {
     setProjects((ps) => ps.filter((p) => p.id !== projectId));
   }, []);
 
+  /* ---------- debug/simulation actions (bulk data ops for fast manual QA) ---------- */
+  const dbgMakeTasks = (count, done) => Array.from({ length: count }, (_, i) => ({
+    id: uid(), title: `Debug task ${i + 1}`, notes: "", due: null,
+    done, createdAt: Date.now(), completedAt: done ? Date.now() : null,
+  }));
+  const dbgAddOpenTasks = useCallback((projectId, count) => {
+    setProjects((ps) => ps.map((p) => p.id !== projectId ? p : { ...p, tasks: [...p.tasks, ...dbgMakeTasks(count, false)] }));
+  }, []);
+  const dbgCompleteAllOpen = useCallback((projectId) => {
+    setProjects((ps) => ps.map((p) => p.id !== projectId ? p : {
+      ...p, tasks: p.tasks.map((t) => t.done ? t : { ...t, done: true, completedAt: Date.now() }),
+    }));
+  }, []);
+  const dbgUncompleteAll = useCallback((projectId) => {
+    setProjects((ps) => ps.map((p) => p.id !== projectId ? p : {
+      ...p, tasks: p.tasks.map((t) => ({ ...t, done: false, completedAt: null })),
+    }));
+  }, []);
+  const dbgRandomProjectNames = ["Nebula Draft", "Comet Log", "Asteroid Notes", "Void Sketch", "Orbit Plan", "Quasar Memo", "Ion Trail", "Dust Ledger"];
+  const dbgMakeRandomProject = (label) => {
+    const done = Math.floor(Math.random() * 45);
+    const open = Math.floor(Math.random() * 6);
+    const name = label || `${dbgRandomProjectNames[Math.floor(Math.random() * dbgRandomProjectNames.length)]} ${Math.floor(Math.random() * 1000)}`;
+    return { id: uid(), name, desc: "debug-generated", createdAt: Date.now(), tasks: [...dbgMakeTasks(done, true), ...dbgMakeTasks(open, false)] };
+  };
+  const dbgAddRandomProject = useCallback(() => {
+    setProjects((ps) => [...ps, dbgMakeRandomProject()]);
+  }, []);
+  const dbgStressTest = useCallback(() => {
+    setProjects((ps) => [...ps, ...Array.from({ length: 8 }, (_, i) => dbgMakeRandomProject(`Stress ${i}`))]);
+  }, []);
+  const dbgClearAll = useCallback(() => {
+    setDbgConfirmClear(false);
+    setSelected(null);
+    setView({ mode: "galaxy", projectId: null });
+    setProjects([]);
+  }, []);
+
   /* ---------- derived ---------- */
   const focusProject = view.mode === "planet" ? projects.find((p) => p.id === view.projectId) : null;
   const selTask = selected
@@ -1369,13 +1409,43 @@ export default function Orrery() {
               <div className="dbg-row"><span className="dbg-k">pos</span> {v3(dbgRec.group.position)}</div>
             </>
           )}
+
+          <div className="dbg-row dbg-sep"><span className="dbg-k">simulate</span></div>
+          <div className="dbg-row">
+            <input
+              type="number" className="dbg-input" min={1} max={300} value={dbgCount}
+              onChange={(e) => setDbgCount(Math.max(1, Math.min(300, parseInt(e.target.value, 10) || 1)))}
+            /> tasks per action
+          </div>
+          {focusProject ? (
+            <div className="dbg-actions">
+              <button className="ghost-btn sm" onClick={() => dbgAddOpenTasks(focusProject.id, dbgCount)}>+ add {dbgCount} open</button>
+              <button className="ghost-btn sm" onClick={() => dbgCompleteAllOpen(focusProject.id)}>✦ complete all open</button>
+              <button className="ghost-btn sm" onClick={() => dbgUncompleteAll(focusProject.id)}>↺ uncomplete all</button>
+            </div>
+          ) : (
+            <div className="dbg-row" style={{ opacity: 0.6 }}>focus a planet for per-world actions</div>
+          )}
+          <div className="dbg-actions">
+            <button className="ghost-btn sm" onClick={dbgAddRandomProject}>🎲 random world</button>
+            <button className="ghost-btn sm" onClick={dbgStressTest}>🌌 stress test (+8 worlds)</button>
+            {dbgConfirmClear ? (
+              <span className="confirm">
+                Clear ALL worlds?
+                <button className="danger-btn sm" onClick={dbgClearAll}>Clear</button>
+                <button className="ghost-btn sm" onClick={() => setDbgConfirmClear(false)}>Keep</button>
+              </span>
+            ) : (
+              <button className="ghost-btn sm dim" onClick={() => setDbgConfirmClear(true)}>💣 clear all worlds</button>
+            )}
+          </div>
         </div>
       )}
 
       {/* bottom controls */}
       <div className="hud bottom-right">
         {saveNote && <span className="save-note">{saveNote}</span>}
-        <button className="ghost-btn sm" onClick={() => setDebugOpen((o) => !o)} aria-label="Toggle debug panel">
+        <button className="ghost-btn sm" onClick={() => { setDebugOpen((o) => !o); setDbgConfirmClear(false); }} aria-label="Toggle debug panel">
           ⚙ debug
         </button>
         <button className="ghost-btn" onClick={cycleSound} aria-label="Cycle ambient sound mode">
@@ -1536,6 +1606,13 @@ const css = `
 .dbg-row { white-space: nowrap; }
 .dbg-k { color: var(--accent); }
 .dbg-sep { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--line); }
+.dbg-input {
+  width: 60px; background: rgba(6,10,26,0.8); border: 1px solid var(--line);
+  border-radius: 6px; color: var(--ink); font-family: inherit; font-size: 11.5px;
+  padding: 2px 6px; margin-right: 4px;
+}
+.dbg-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.dbg-actions .ghost-btn.sm { font-size: 11px; padding: 5px 9px; white-space: nowrap; }
 .index {
   background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
   padding: 8px; width: min(260px, 80vw); max-height: 44vh; overflow: auto;
