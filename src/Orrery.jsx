@@ -34,6 +34,12 @@ function fibSphere(n) {
 // their neighbors' hit-spheres (which was causing clicks near a big planet's
 // dust to land on a different, nearby planet), and the slow, low-frequency
 // vertical drift reads as a calm flowing curve instead of a jagged zigzag.
+// A planet's visual footprint reaches well past its body: rings sit at 2.15R,
+// and the additive atmosphere glow's meaningfully-bright zone runs to ~2.3R
+// (it fades further past that). Spacing needs to clear THIS, not the small
+// click hit-sphere, or halos/rings wash into each other at large sizes.
+const PLANET_VISUAL_SPREAD = 2.6;
+
 function computeLayout(projects) {
   const ga = 2.39996;
   const positions = [];
@@ -46,8 +52,8 @@ function computeLayout(projects) {
       prevR = R;
       continue;
     }
-    const gap = 6 + R * 1.1; // breathing room, scaled to the incoming planet's size
-    orbitR = Math.max(orbitR + prevR + R + gap, 14);
+    const gap = 8; // flat breathing room on top of the size-scaled clearance below
+    orbitR = Math.max(orbitR + (prevR + R) * PLANET_VISUAL_SPREAD + gap, 18);
     const a = i * ga;
     const y = Math.sin(i * 0.27 + 0.6) * (2.6 + R * 0.35);
     positions.push(new THREE.Vector3(Math.cos(a) * orbitR, y, Math.sin(a) * orbitR));
@@ -607,7 +613,10 @@ export default function Orrery() {
     const mount = mountRef.current;
     if (!mount) return;
     const scene = new THREE.Scene();
-    scene.fog = new THREE.FogExp2(0x04060f, 0.0075);
+    // Lowered from 0.0075: planets now space out much further apart as they grow
+    // (see PLANET_VISUAL_SPREAD), and the old density fogged out most of the
+    // galaxy overview once a few large planets pushed the framing distance up.
+    scene.fog = new THREE.FogExp2(0x04060f, 0.0028);
     const camera = new THREE.PerspectiveCamera(52, mount.clientWidth / mount.clientHeight, 0.1, 600);
     camera.position.set(0, 34, 96);
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
