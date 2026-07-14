@@ -3,6 +3,14 @@ import * as THREE from "three";
 import * as Tone from "tone";
 import { mergeVertices } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 
+// Injected by .github/workflows/deploy.yml at build time (VITE_-prefixed env
+// vars are auto-exposed by Vite); falls back to "dev" for local `npm run dev`.
+const BUILD_SHA = (import.meta.env.VITE_BUILD_SHA || "dev").slice(0, 7);
+const BUILD_TIME_RAW = import.meta.env.VITE_BUILD_TIME || "";
+const BUILD_TIME_LABEL = BUILD_TIME_RAW
+  ? new Date(BUILD_TIME_RAW).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })
+  : "local";
+
 /* ---------------- deterministic helpers ---------------- */
 function strHash(s) {
   let h = 2166136261;
@@ -350,17 +358,22 @@ function buildPlanetRecord(project, orbit) {
   atmo.scale.set(aScale, aScale, 1);
   group.add(atmo);
 
-  // rings for mature worlds
+  // rings for mature worlds — not every eligible planet gets one; a dedicated,
+  // independent seed (rather than the shared `rng`) decides per-project so
+  // this doesn't perturb any other deterministic terrain/color values.
   let ring = null;
   if (doneTasks.length >= 8) {
-    const rg = new THREE.RingGeometry(R * 1.55, R * 2.15, 72);
-    const rm = new THREE.MeshBasicMaterial({
-      color: pal.accent, side: THREE.DoubleSide, transparent: true, opacity: 0.20,
-      blending: THREE.AdditiveBlending, depthWrite: false,
-    });
-    ring = new THREE.Mesh(rg, rm);
-    ring.rotation.x = Math.PI / 2 - 0.35 - rng() * 0.3;
-    group.add(ring);
+    const ringRng = mulberry32(strHash(project.id + "|ring"));
+    if (ringRng() < 0.5) {
+      const rg = new THREE.RingGeometry(R * 1.55, R * 2.15, 72);
+      const rm = new THREE.MeshBasicMaterial({
+        color: pal.accent, side: THREE.DoubleSide, transparent: true, opacity: 0.20,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      });
+      ring = new THREE.Mesh(rg, rm);
+      ring.rotation.x = Math.PI / 2 - 0.35 - rng() * 0.3;
+      group.add(ring);
+    }
   }
 
   // stardust clusters for open tasks — soft round cloud-puffs, not hard squares
@@ -391,16 +404,21 @@ function buildPlanetRecord(project, orbit) {
     });
     const points = new THREE.Points(pg, pm);
     const clickSphere = new THREE.Mesh(
-      new THREE.SphereGeometry(0.5, 8, 8),
+      new THREE.SphereGeometry(0.5 + R * 0.06, 8, 8), // scales with R — a fixed radius became a tiny, hard-to-hit target on large planets
       new THREE.MeshBasicMaterial({ visible: false })
     );
     clickSphere.userData.dustTaskId = task.id;
     const cluster = new THREE.Group();
     cluster.add(points, clickSphere);
     group.add(cluster);
+    // gap and per-task stagger both scale with R — a fixed offset (the old
+    // "R + 1.35 + i*0.55") was only ~8% of R on a large planet, so dust
+    // clusters hugged the surface closely enough to read as embedded in it.
+    const dustGap = Math.max(1.4, R * 0.35);
+    const dustStagger = 0.4 + R * 0.12;
     dust.push({
       cluster, points, clickSphere, task,
-      orbitR: R + 1.35 + (i % 5) * 0.55,
+      orbitR: R + dustGap + (i % 5) * dustStagger,
       speed: 0.12 + trng() * 0.12,
       phase: trng() * Math.PI * 2,
       incline: (trng() - 0.5) * 0.9,
@@ -450,6 +468,8 @@ export default function Orrery() {
   const [intakeOpen, setIntakeOpen] = useState(false);
   const [intakeMode, setIntakeMode] = useState("project");
   const [indexOpen, setIndexOpen] = useState(false);
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [, setDebugTick] = useState(0); // forces the debug panel to re-read live world/project data
   const [soundMode, setSoundMode] = useState("off"); // "off" | "ambient" | "classical"
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [confirmDeleteTask, setConfirmDeleteTask] = useState(null);
@@ -467,6 +487,13 @@ export default function Orrery() {
   useEffect(() => {
     setConfirmDeleteTask(null);
   }, [selected]);
+
+  /* ---------- debug panel refresh ---------- */
+  useEffect(() => {
+    if (!debugOpen) return;
+    const id = setInterval(() => setDebugTick((t) => t + 1), 300);
+    return () => clearInterval(id);
+  }, [debugOpen]);
 
   // form state
   const [fProjName, setFProjName] = useState("");
@@ -738,9 +765,11 @@ export default function Orrery() {
     let raf;
     const animate = () => {
       raf = requestAnimationFrame(animate);
-      const dt = Math.min(world.clock.getDelta(), 0.05);
+      const rawDt = world.clock.getDelta();
+      const dt = Math.min(rawDt, 0.05);
       const t = world.clock.elapsedTime;
       const motion = reducedMotion.current ? 0.25 : 1;
+      if (rawDt > 0) world.fps = world.fps ? world.fps * 0.9 + (1 / rawDt) * 0.1 : 1 / rawDt;
 
       stars.rotation.y += dt * 0.004 * motion;
       const sunPulse = 1 + Math.sin(t * 0.9) * 0.03 * motion;
@@ -1166,6 +1195,13 @@ export default function Orrery() {
     : null;
   const overdue = (t) => t.due && !t.done && new Date(t.due + "T23:59:59") < new Date();
 
+  /* ---------- debug panel data (re-read live each debugTick while open) ---------- */
+  const dbgWorld = worldRef.current;
+  const dbgRec = dbgWorld && view.mode === "planet" ? dbgWorld.planets.get(view.projectId) : null;
+  const dbgTotalDone = projects.reduce((s, p) => s + p.tasks.filter((t) => t.done).length, 0);
+  const dbgTotalTasks = projects.reduce((s, p) => s + p.tasks.length, 0);
+  const v3 = (v) => v ? `${v.x.toFixed(1)}, ${v.y.toFixed(1)}, ${v.z.toFixed(1)}` : "—";
+
   /* ---------- render ---------- */
   return (
     <div className="orrery-root">
@@ -1193,6 +1229,7 @@ export default function Orrery() {
           <div className="brand">
             <div className="brand-name">ORRERY</div>
             <div className="brand-sub">a galaxy built from your work</div>
+            <div className="build-tag">build {BUILD_SHA} · {BUILD_TIME_LABEL}</div>
           </div>
         )}
       </header>
@@ -1312,9 +1349,35 @@ export default function Orrery() {
         )}
       </div>
 
+      {/* debug panel */}
+      {debugOpen && (
+        <div className="hud debug-panel">
+          <div className="dbg-row"><span className="dbg-k">build</span> {BUILD_SHA} · {BUILD_TIME_LABEL}</div>
+          <div className="dbg-row"><span className="dbg-k">view</span> {view.mode}{focusProject ? ` · ${focusProject.name}` : ""}</div>
+          <div className="dbg-row"><span className="dbg-k">projects</span> {projects.length} · tasks {dbgTotalDone}/{dbgTotalTasks}</div>
+          <div className="dbg-row"><span className="dbg-k">sound</span> {soundMode} · <span className="dbg-k">motion</span> {reducedMotion.current ? "reduced" : "full"}</div>
+          <div className="dbg-row"><span className="dbg-k">fps</span> {dbgWorld?.fps ? dbgWorld.fps.toFixed(0) : "—"}</div>
+          <div className="dbg-row"><span className="dbg-k">star</span> R={STAR_RADIUS} @ origin</div>
+          <div className="dbg-row"><span className="dbg-k">camera</span> {v3(dbgWorld?.camPos)}</div>
+          <div className="dbg-row"><span className="dbg-k">cam target</span> {v3(dbgWorld?.camTarget)}</div>
+          {dbgRec && (
+            <>
+              <div className="dbg-row dbg-sep"><span className="dbg-k">focused planet</span></div>
+              <div className="dbg-row"><span className="dbg-k">R</span> {dbgRec.R.toFixed(2)} · <span className="dbg-k">ring</span> {dbgRec.ring ? "yes" : "no"}</div>
+              <div className="dbg-row"><span className="dbg-k">orbit r</span> {dbgRec.orbitRadius.toFixed(1)} · <span className="dbg-k">θ</span> {((dbgRec.orbitAngle * 180 / Math.PI) % 360).toFixed(1)}° · <span className="dbg-k">v</span> {dbgRec.orbitSpeed.toFixed(5)}</div>
+              <div className="dbg-row"><span className="dbg-k">chunks</span> {dbgRec.chunks.length} · <span className="dbg-k">dust</span> {dbgRec.dust.length}</div>
+              <div className="dbg-row"><span className="dbg-k">pos</span> {v3(dbgRec.group.position)}</div>
+            </>
+          )}
+        </div>
+      )}
+
       {/* bottom controls */}
       <div className="hud bottom-right">
         {saveNote && <span className="save-note">{saveNote}</span>}
+        <button className="ghost-btn sm" onClick={() => setDebugOpen((o) => !o)} aria-label="Toggle debug panel">
+          ⚙ debug
+        </button>
         <button className="ghost-btn" onClick={cycleSound} aria-label="Cycle ambient sound mode">
           {soundMode === "off" ? "♪ sound off" : soundMode === "ambient" ? "♪ ambient hum" : "♪ soft strings"}
         </button>
@@ -1422,6 +1485,7 @@ const css = `
   font-size: 26px; letter-spacing: 0.34em; color: var(--ink);
 }
 .brand-sub { font-size: 12px; color: var(--ink-dim); letter-spacing: 0.08em; margin-top: 2px; }
+.build-tag { font-family: monospace; font-size: 10px; color: var(--ink-dim); opacity: 0.55; margin-top: 6px; }
 
 .project-head {
   top: 18px; left: 50%; transform: translateX(-50%);
@@ -1462,6 +1526,16 @@ const css = `
 .empty-sub { color: var(--ink-dim); margin: 8px 0 18px; font-size: 14px; }
 
 .index-wrap { left: 18px; bottom: 18px; display: flex; flex-direction: column-reverse; align-items: flex-start; gap: 8px; }
+
+.debug-panel {
+  top: 18px; right: 18px; width: min(300px, 80vw); max-height: 70vh; overflow: auto;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 12px 14px; backdrop-filter: blur(10px);
+  font-family: monospace; font-size: 11.5px; line-height: 1.7; color: var(--ink-dim);
+}
+.dbg-row { white-space: nowrap; }
+.dbg-k { color: var(--accent); }
+.dbg-sep { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--line); }
 .index {
   background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
   padding: 8px; width: min(260px, 80vw); max-height: 44vh; overflow: auto;

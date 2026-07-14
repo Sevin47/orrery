@@ -24,6 +24,9 @@ jobs:
           node-version: 20
       - run: npm ci
       - run: npm run build
+        env:
+          VITE_BUILD_SHA: ${{ github.sha }}
+          VITE_BUILD_TIME: ${{ github.event.head_commit.timestamp || github.event.repository.pushed_at }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
