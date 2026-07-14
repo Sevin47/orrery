@@ -945,7 +945,23 @@ export default function Orrery() {
     if (view.mode === "galaxy") {
       const n = projects.length;
       const far = Math.max(30 + n * 6.5, (world.galaxyExtent || 20) * 1.7);
-      world.camTarget.set(0, 12 + n * 1.5 + (world.galaxyExtent || 20) * 0.12, Math.min(420, far));
+      // Clamp lowered from 420: at this fog density, 420 units out is already
+      // ~69% fogged — fine for the rare planet that reaches it, but once a
+      // galaxy is big enough to NEED the clamp (dozens of projects, or a few
+      // heavy stress-test batches), the camera sits there permanently and
+      // everything, including the star, reads as washed out. 260 caps worst-
+      // case fog around ~52% instead. Small/typical galaxies are unaffected —
+      // they were already resolving well under either ceiling.
+      const camZ = Math.min(260, far);
+      // Y used to scale off the raw, unbounded galaxyExtent while Z was capped
+      // at 420 — with enough projects (extent grows without limit as more are
+      // added) that made the camera climb to an absurd height independently
+      // of how far back it actually was, producing a near-overhead view into
+      // fog instead of a wide establishing shot. 0.0706 reproduces the old
+      // ratio (extent*0.12 when Z == extent*1.7, the un-clamped case) but off
+      // the actual clamped distance, so it stays proportionate at any scale.
+      const camY = 12 + n * 1.5 + camZ * 0.0706;
+      world.camTarget.set(0, camY, camZ);
       world.lookTarget.set(0, 0, 0);
     }
   }, [view.mode, projects]);
