@@ -28,12 +28,32 @@ function fibSphere(n) {
   }
   return pts;
 }
-function layoutPos(i) {
-  if (i === 0) return new THREE.Vector3(0, 0, 0);
+// Lays every project out along a golden-angle spiral, but — unlike a fixed
+// per-index step — grows the orbital radius by each planet's own footprint
+// as it goes. That keeps huge (Jupiter-scale) worlds from ever overlapping
+// their neighbors' hit-spheres (which was causing clicks near a big planet's
+// dust to land on a different, nearby planet), and the slow, low-frequency
+// vertical drift reads as a calm flowing curve instead of a jagged zigzag.
+function computeLayout(projects) {
   const ga = 2.39996;
-  const a = i * ga;
-  const r = 10 + i * 6.4; // wider spacing — mature planets now grow considerably larger
-  return new THREE.Vector3(Math.cos(a) * r, Math.sin(i * 1.93) * 3.2, Math.sin(a) * r);
+  const positions = [];
+  let orbitR = 0;
+  let prevR = 0;
+  for (let i = 0; i < projects.length; i++) {
+    const R = radiusFor(projects[i]);
+    if (i === 0) {
+      positions.push(new THREE.Vector3(0, 0, 0));
+      prevR = R;
+      continue;
+    }
+    const gap = 6 + R * 1.1; // breathing room, scaled to the incoming planet's size
+    orbitR = Math.max(orbitR + prevR + R + gap, 14);
+    const a = i * ga;
+    const y = Math.sin(i * 0.27 + 0.6) * (2.6 + R * 0.35);
+    positions.push(new THREE.Vector3(Math.cos(a) * orbitR, y, Math.sin(a) * orbitR));
+    prevR = R;
+  }
+  return positions;
 }
 function paletteFor(project) {
   const h = strHash(project.id);
@@ -48,11 +68,10 @@ function paletteFor(project) {
 function radiusFor(project) {
   const done = project.tasks.filter((t) => t.done).length;
   const total = project.tasks.length;
-  // power-curve growth so magnitude reads clearly across small projects while
-  // still tapering off (sqrt-ish) for very large ones, rather than plateauing
-  // almost immediately like the old linear-capped version did.
-  const growth = Math.pow(done, 0.62) * 0.85 + Math.log1p(total) * 0.12;
-  return 1.0 + Math.min(4.6, growth);
+  // power-curve growth spanning roughly an Earth-to-Jupiter ratio (~11x) between
+  // a freshly-started world and a long-running one, before tapering off.
+  const growth = Math.pow(done, 0.72) * 1.05 + Math.log1p(total) * 0.15;
+  return 1.0 + Math.min(15, growth);
 }
 function signature(p) {
   return p.id + "|" + p.tasks.map((t) => t.id + (t.done ? "1" : "0")).join(",");
@@ -706,8 +725,11 @@ export default function Orrery() {
         world.planets.delete(id);
       }
     }
+    const positions = computeLayout(projects);
+    let outer = 20;
     projects.forEach((p, i) => {
-      const pos = layoutPos(i);
+      const pos = positions[i];
+      outer = Math.max(outer, pos.length() + radiusFor(p));
       const sig = signature(p);
       let rec = world.planets.get(p.id);
       if (rec && rec.sig !== sig) {
@@ -728,6 +750,7 @@ export default function Orrery() {
         rec.group.position.copy(pos);
       }
     });
+    world.galaxyExtent = outer;
   }, [projects]);
 
   /* ---------- camera targets (galaxy) ---------- */
@@ -736,11 +759,11 @@ export default function Orrery() {
     if (!world) return;
     if (view.mode === "galaxy") {
       const n = projects.length;
-      const far = 30 + n * 6.5;
-      world.camTarget.set(0, 12 + n * 1.5, Math.min(110, far));
+      const far = Math.max(30 + n * 6.5, (world.galaxyExtent || 20) * 1.7);
+      world.camTarget.set(0, 12 + n * 1.5 + (world.galaxyExtent || 20) * 0.12, Math.min(420, far));
       world.lookTarget.set(0, 0, 0);
     }
-  }, [view.mode, projects.length]);
+  }, [view.mode, projects]);
 
   /* ---------- orbit init on planet focus (drag-to-rotate state) ---------- */
   useEffect(() => {
