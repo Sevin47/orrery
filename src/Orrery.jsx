@@ -50,7 +50,7 @@ const STAR_CLEARANCE = STAR_RADIUS * PLANET_VISUAL_SPREAD + 10; // keep planet 0
 // grows with radius) but everything is slowed to a calm, ambient drift rather
 // than anything physically real: a full revolution takes many minutes even
 // for the innermost planet.
-const ORBIT_ANGULAR_K = 0.055;
+const ORBIT_ANGULAR_K = 0.1;
 function orbitSpeedFor(radius) {
   return ORBIT_ANGULAR_K / Math.sqrt(radius);
 }
@@ -670,13 +670,16 @@ export default function Orrery() {
     sunLight.position.set(0, 0, 0);
     scene.add(sunLight);
 
-    // starfield
+    // starfield — pushed well beyond any plausible planet orbit or the sun's
+    // own glow (400-580, vs. planets/sun living well under 300 in practice) so
+    // background stars never read as floating in front of foreground objects.
+    // They're meant to be the impossibly-distant backdrop, not nearby bodies.
     const starGeo = new THREE.BufferGeometry();
     const starN = 2200;
     const sp = new Float32Array(starN * 3);
     const sc = new Float32Array(starN * 3);
     for (let i = 0; i < starN; i++) {
-      const r = 140 + Math.random() * 180;
+      const r = 400 + Math.random() * 180;
       const th = Math.random() * Math.PI * 2;
       const ph = Math.acos(2 * Math.random() - 1);
       sp[i * 3] = r * Math.sin(ph) * Math.cos(th);
@@ -829,15 +832,13 @@ export default function Orrery() {
         }
       }
 
-      // camera glide
-      const drift = (v.mode === "galaxy" && !reducedMotion.current) ? 1 : 0;
-      const px = world.mouse.x * 3 * drift, py = world.mouse.y * 1.6 * drift;
+      // camera glide — galaxy view now holds a static wide framing once eased
+      // in (no mouse-parallax drift), so the only motion on screen is the
+      // planets themselves orbiting the star.
       if (v.mode === "planet" && world.orbit?.dragging) {
         world.camPos.set(world.camTarget.x, world.camTarget.y, world.camTarget.z);
       } else {
-        world.camPos.lerp(new THREE.Vector3(
-          world.camTarget.x + px, world.camTarget.y - py, world.camTarget.z
-        ), Math.min(1, dt * 2.2));
+        world.camPos.lerp(world.camTarget, Math.min(1, dt * 2.2));
       }
       camera.position.copy(world.camPos);
       world.look.lerp(world.lookTarget, Math.min(1, dt * 2.6));
