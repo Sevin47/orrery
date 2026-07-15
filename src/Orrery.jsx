@@ -42,10 +42,11 @@ function fibSphere(n) {
 // their neighbors' hit-spheres (which was causing clicks near a big planet's
 // dust to land on a different, nearby planet), and the slow, low-frequency
 // vertical drift reads as a calm flowing curve instead of a jagged zigzag.
-// A planet's visual footprint reaches well past its body: rings sit at 2.15R,
-// and the additive atmosphere glow's meaningfully-bright zone runs to ~2.3R
-// (it fades further past that). Spacing needs to clear THIS, not the small
-// click hit-sphere, or halos/rings wash into each other at large sizes.
+// A planet's visual footprint reaches well past its body: the additive
+// atmosphere glow's meaningfully-bright zone runs to ~2.3R (it fades further
+// past that), and Q4 "drifting" dust orbits out to ~1.3x the normal gap.
+// Spacing needs to clear THIS, not the small click hit-sphere, or halos
+// wash into each other at large sizes.
 const PLANET_VISUAL_SPREAD = 2.6;
 
 // The central star every project-planet orbits. One system for now; a later
@@ -118,9 +119,20 @@ function paletteFor(project) {
 function radiusFor(project) {
   const done = project.tasks.filter((t) => t.done).length;
   const total = project.tasks.length;
-  // power-curve growth spanning roughly an Earth-to-Jupiter ratio (~11x) between
-  // a freshly-started world and a long-running one, before tapering off.
-  const growth = Math.pow(done, 0.72) * 1.05 + Math.log1p(total) * 0.15;
+  // Size = scope × completion. The old raw-done-count power curve made a
+  // 90%-done small project render SMALLER than a 20%-done monster — size
+  // read as "most accomplished-looking" when users scan for "closest to
+  // done". Scope (total tasks, log-damped) still matters, but completion
+  // ratio carries most of the growth, so finishing work is what makes a
+  // world visibly swell. Honest side effect: adding open tasks shrinks a
+  // planet slightly — the ratio dropped, there's more world left to build.
+  // ratio carries 75% of the growth range: at these weights a 90%-done
+  // 10-task world (R≈5.9) edges out a 20%-done 200-task one (R≈5.7) —
+  // the exact inversion the old formula got wrong — while a completed
+  // large world still out-sizes a completed small one.
+  const ratio = total ? done / total : 0;
+  const scope = Math.log1p(total);
+  const growth = scope * 2.2 * (0.25 + 0.75 * ratio);
   return 1.0 + Math.min(15, growth);
 }
 function signature(p) {
@@ -161,6 +173,29 @@ function projectPriority(p) {
     else if (q === "q3") q3++;
   }
   return { q1, q3 };
+}
+// Dust agitation — open-task stardust moves by triage state: Q1 orbits fast
+// and tight (agitated, insistent), Q3 quick, Q2 calm baseline, Q4 slow and
+// distant (drifting away). Motion is pre-attentive, so an agitated planet
+// pops even peripherally; the ▲ labels/badges remain the static fallback.
+// Speed applies LIVE (re-triage updates it seamlessly under accumulated
+// angles); orbit distance is build-time only, so nothing teleports.
+const DUST_QUAD_SPEED = { q1: 2.2, q2: 1.0, q3: 1.5, q4: 0.55 };
+const DUST_QUAD_GAP = { q1: 0.8, q2: 1.0, q3: 1.0, q4: 1.3 };
+// Dust severity color + size — within a focused planet, hue is unspent (the
+// "hue = project identity" budget only binds in galaxy view, where color
+// tells worlds apart; here every cluster shares one project), so it's the
+// right channel for "click this one first". Never the SOLE channel: speed,
+// orbit distance, and the ▲/△ glyph on the task label carry the same rank.
+const DUST_QUAD_SIZE = { q1: 0.32, q2: 0.24, q3: 0.28, q4: 0.20 };
+const DUST_QUAD_GLYPH = { q1: "▲ ", q2: "", q3: "△ ", q4: "" };
+function dustQuadColor(quad, pal) {
+  switch (quad) {
+    case "q1": return new THREE.Color(0xffab66); // hot amber — do first
+    case "q3": return new THREE.Color(0xe8dc8a); // pale caution yellow — due soon, not important
+    case "q4": return new THREE.Color(0x5a6478); // dim slate — drifting
+    default: return pal.accent.clone();          // q2 keeps the project's identity accent
+  }
 }
 // Project archetypes — the user's five real work categories. This slice they
 // only drive intake pre-fills (default importance, and exec fire drills
@@ -328,7 +363,7 @@ function buildPlanetShell(project, orbit) {
   group.add(hit);
 
   return {
-    group, spin, impostor, chunks: [], dust: [], atmo, ring: null, hit,
+    group, spin, impostor, chunks: [], dust: [], atmo, hit,
     R, pal, sig: signature(project), detailBuilt: false,
     explode: 0, spinAngle: Math.random() * Math.PI * 2,
     spinSpeed: 0.05 + rng() * 0.05,
@@ -483,27 +518,17 @@ function attachPlanetDetail(rec, project) {
     });
   }
 
-  // rings for mature worlds — not every eligible planet gets one; a dedicated,
-  // independent seed (rather than the shared `rng`) decides per-project so
-  // this doesn't perturb any other deterministic terrain/color values.
-  if (doneTasks.length >= 8) {
-    const ringRng = mulberry32(strHash(project.id + "|ring"));
-    if (ringRng() < 0.5) {
-      const rg = new THREE.RingGeometry(R * 1.55, R * 2.15, 72);
-      const rm = new THREE.MeshBasicMaterial({
-        color: pal.accent, side: THREE.DoubleSide, transparent: true, opacity: 0.20,
-        blending: THREE.AdditiveBlending, depthWrite: false,
-      });
-      const ring = new THREE.Mesh(rg, rm);
-      ring.rotation.x = Math.PI / 2 - 0.35 - rng() * 0.3;
-      group.add(ring);
-      rec.ring = ring;
-    }
-  }
+  // (rings retired: they were a per-project 50% coin flip — decoration that
+  // read as a milestone but carried no information, teaching users to hunt
+  // for a pattern that didn't exist. If a circular element returns, it
+  // should encode something real, e.g. a completion arc.)
 
-  // stardust clusters for open tasks — soft round cloud-puffs, not hard squares
+  // stardust clusters for open tasks — soft round cloud-puffs, not hard squares.
+  // The glow texture and per-vertex jitter are NEUTRAL (grayscale); the actual
+  // hue lives on material.color so severity recoloring on live re-triage is a
+  // single material property write, not a vertex-buffer rewrite.
   const dust = rec.dust;
-  const dustMap = glowTexture(`${Math.round(pal.accent.r * 255)},${Math.round(pal.accent.g * 255)},${Math.round(pal.accent.b * 255)}`);
+  const dustMap = glowTexture("255,255,255");
   openTasks.forEach((task, i) => {
     const trng = mulberry32(strHash(task.id));
     const count = 72;
@@ -516,15 +541,17 @@ function attachPlanetDetail(rec, project) {
       arr[k * 3 + 1] = rr * Math.cos(ph) * 0.7;
       arr[k * 3 + 2] = rr * Math.sin(ph) * Math.sin(th);
       const jitter = 0.7 + trng() * 0.55; // uneven brightness — reads as wispy dust, not a uniform blob
-      colArr[k * 3] = pal.accent.r * jitter;
-      colArr[k * 3 + 1] = pal.accent.g * jitter;
-      colArr[k * 3 + 2] = pal.accent.b * jitter;
+      colArr[k * 3] = jitter;
+      colArr[k * 3 + 1] = jitter;
+      colArr[k * 3 + 2] = jitter;
     }
     const pg = new THREE.BufferGeometry();
     pg.setAttribute("position", new THREE.BufferAttribute(arr, 3));
     pg.setAttribute("color", new THREE.Float32BufferAttribute(colArr, 3));
+    const quad = taskQuadrant(task);
     const pm = new THREE.PointsMaterial({
-      map: dustMap, vertexColors: true, size: 0.24, transparent: true, opacity: 0.85,
+      map: dustMap, vertexColors: true, size: DUST_QUAD_SIZE[quad],
+      color: dustQuadColor(quad, pal), transparent: true, opacity: 0.85,
       blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true,
     });
     const points = new THREE.Points(pg, pm);
@@ -541,11 +568,14 @@ function attachPlanetDetail(rec, project) {
     // clusters hugged the surface closely enough to read as embedded in it.
     const dustGap = Math.max(1.4, R * 0.35);
     const dustStagger = 0.4 + R * 0.12;
+    const phase = trng() * Math.PI * 2;
     dust.push({
       cluster, points, clickSphere, task,
-      orbitR: R + dustGap + (i % 5) * dustStagger,
+      orbitR: R + (dustGap + (i % 5) * dustStagger) * DUST_QUAD_GAP[quad],
       speed: 0.12 + trng() * 0.12,
-      phase: trng() * Math.PI * 2,
+      quadSpeed: DUST_QUAD_SPEED[quad],
+      phase,
+      ang: phase, // accumulated orbit angle — advanced per-frame so speed can change live
       incline: (trng() - 0.5) * 0.9,
       anim: null, // {t} while crystallizing
     });
@@ -579,6 +609,35 @@ function refreshPlanetPriorities(world, projects) {
       if (rec.label.textContent !== wanted) rec.label.textContent = wanted;
       rec.label.classList.toggle("q1", rec.q1Count > 0);
     }
+    // live dust re-triage on the focused planet: importance/due edits don't
+    // change signature() (no rebuild, by design), and d.task is a snapshot
+    // from build time — look the task up fresh and update the agitation
+    // speed, severity color/size, and label glyph. Seamless under
+    // accumulated angles; orbit distance stays as built so nothing jumps.
+    if (rec.detailBuilt) {
+      for (const d of rec.dust) {
+        const fresh = p.tasks.find((t) => t.id === d.task.id);
+        if (fresh) {
+          d.task = fresh;
+          const quad = taskQuadrant(fresh);
+          d.quadSpeed = DUST_QUAD_SPEED[quad];
+          d.points.material.color.copy(dustQuadColor(quad, rec.pal));
+          d.points.material.size = DUST_QUAD_SIZE[quad];
+        }
+      }
+      if (rec.taskLabels) {
+        for (const tl of rec.taskLabels) {
+          if (tl.kind !== "dust") continue;
+          const fresh = p.tasks.find((t) => t.id === tl.taskId);
+          if (!fresh) continue;
+          const quad = taskQuadrant(fresh);
+          const wanted = DUST_QUAD_GLYPH[quad] + fresh.title;
+          if (tl.el.textContent !== wanted) tl.el.textContent = wanted;
+          tl.el.classList.toggle("q1", quad === "q1");
+          tl.el.classList.toggle("q3", quad === "q3");
+        }
+      }
+    }
   }
 }
 
@@ -586,7 +645,6 @@ function detachPlanetDetail(rec) {
   if (!rec.detailBuilt) return;
   rec.chunks.forEach((c) => { rec.spin.remove(c.mesh); disposeThreeObject(c.mesh); });
   rec.dust.forEach((d) => { rec.group.remove(d.cluster); disposeThreeObject(d.cluster); });
-  if (rec.ring) { rec.group.remove(rec.ring); disposeThreeObject(rec.ring); rec.ring = null; }
   rec.chunks = [];
   rec.dust = [];
   rec.impostor.visible = true;
@@ -635,6 +693,15 @@ export default function Orrery() {
   const reducedMotion = useRef(
     typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
   );
+  // track live OS-setting changes — the ref is read per-frame in the animate
+  // loop, so no re-render is needed, just keep it current
+  useEffect(() => {
+    const mq = window.matchMedia?.("(prefers-reduced-motion: reduce)");
+    if (!mq) return;
+    const onChange = (e) => { reducedMotion.current = e.matches; };
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
 
   useEffect(() => {
     setConfirmDeleteTask(null);
@@ -969,7 +1036,10 @@ export default function Orrery() {
         );
         const focused = v.mode === "planet" && v.projectId === pid;
         const target = focused ? 1 : 0;
-        rec.explode += (target - rec.explode) * Math.min(1, dt * 2.4);
+        // reduced motion means SNAP to the final state, not slow-mo — the
+        // scatter/reform tween is one of the most vestibular-heavy effects
+        if (reducedMotion.current) rec.explode = target;
+        else rec.explode += (target - rec.explode) * Math.min(1, dt * 2.4);
         rec.spinAngle += dt * rec.spinSpeed * motion * (1 - 0.75 * rec.explode);
         rec.spin.rotation.y = rec.spinAngle;
         const amt = rec.explode * (rec.R * 0.55 + 0.45);
@@ -981,12 +1051,14 @@ export default function Orrery() {
             ch.mesh.position.copy(ch.dir).multiplyScalar(amt);
           }
         });
-        if (rec.ring) rec.ring.rotation.z += dt * 0.02 * motion;
-        rec.dust.forEach((d, i) => {
+        rec.dust.forEach((d) => {
+          // orbit angle is ACCUMULATED (not derived from absolute time) so
+          // quadSpeed can change on live re-triage without the cluster
+          // teleporting to a new time-derived position.
           if (d.anim) {
             d.anim.t = Math.min(1, d.anim.t + dt / 1.35);
             const k = 1 - d.anim.t;
-            const ang = d.phase + t * d.speed + d.anim.t * 4.0;
+            const ang = d.ang + d.anim.t * 4.0; // base angle frozen at collapse start, spiral term unchanged
             const rr = d.orbitR * k * k;
             d.cluster.position.set(
               Math.cos(ang) * rr,
@@ -996,11 +1068,11 @@ export default function Orrery() {
             d.points.material.opacity = 0.95 * k + 0.05;
             d.cluster.scale.setScalar(Math.max(0.05, k));
           } else {
-            const ang = d.phase + t * d.speed * motion;
+            d.ang += dt * d.speed * (d.quadSpeed || 1) * motion;
             d.cluster.position.set(
-              Math.cos(ang) * d.orbitR,
-              Math.sin(ang * 0.7 + d.incline) * d.orbitR * 0.35,
-              Math.sin(ang) * d.orbitR
+              Math.cos(d.ang) * d.orbitR,
+              Math.sin(d.ang * 0.7 + d.incline) * d.orbitR * 0.35,
+              Math.sin(d.ang) * d.orbitR
             );
             const tw = 0.75 + Math.sin(t * 2 + d.phase * 7) * 0.2;
             d.points.material.opacity = tw;
@@ -1175,10 +1247,11 @@ export default function Orrery() {
     });
     rec.dust.forEach((d) => {
       const el = document.createElement("div");
-      el.className = "task-label";
-      el.textContent = d.task.title;
+      const quad = taskQuadrant(d.task);
+      el.className = "task-label" + (quad === "q1" ? " q1" : quad === "q3" ? " q3" : "");
+      el.textContent = DUST_QUAD_GLYPH[quad] + d.task.title;
       layer.appendChild(el);
-      rec.taskLabels.push({ el, kind: "dust", cluster: d.cluster });
+      rec.taskLabels.push({ el, kind: "dust", cluster: d.cluster, taskId: d.task.id });
     });
   };
 
@@ -1367,6 +1440,25 @@ export default function Orrery() {
         return;
       }
 
+      // triage key — fly to the world that most needs attention; press again
+      // to cycle through every ▲ world (same order as the Index sort).
+      if (e.key === "1") {
+        const q1List = projectsRef.current
+          .map((p) => ({ p, q1: projectPriority(p).q1 }))
+          .filter((x) => x.q1 > 0)
+          .sort((a, b) => b.q1 - a.q1)
+          .map((x) => x.p);
+        if (!q1List.length) return;
+        e.preventDefault();
+        const v = viewRef.current;
+        const idx = v.mode === "planet" ? q1List.findIndex((p) => p.id === v.projectId) : -1;
+        const next = q1List[(idx + 1) % q1List.length];
+        setView({ mode: "planet", projectId: next.id });
+        setSelected(null);
+        setHoverTip(null);
+        return;
+      }
+
       if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
       const ps = projectsRef.current;
       if (!ps.length) return;
@@ -1529,7 +1621,10 @@ export default function Orrery() {
         return { ...p, tasks };
       }));
       setTimeout(() => {
-        spawnBloom(projectId, projectDone);
+        // bloom flash scales a sprite up to ~14x — skip under reduced motion
+        // (same pattern as the dust-collapse skip below); the chime remains
+        // as the completion acknowledgment
+        if (!reducedMotion.current) spawnBloom(projectId, projectDone);
         chime(projectDone);
       }, 60);
     };
@@ -1697,7 +1792,7 @@ export default function Orrery() {
           <div className="ph-hint">
             {focusProject.tasks.length === 0
               ? "A newborn core. Add tasks to give it matter. · ← → to switch worlds"
-              : "Tap a fragment to recall its work · tap orbiting stardust to view open tasks · drag to rotate · scroll to zoom · ← → to switch worlds"}
+              : "Tap a fragment to recall its work · tap orbiting stardust to view open tasks · drag to rotate · scroll to zoom · ← → to switch worlds · 1 → next ▲"}
           </div>
         </div>
       )}
@@ -1795,7 +1890,7 @@ export default function Orrery() {
                 );
               })}
             {projects.length > 0 && (
-              <div className="idx-legend">▲ important & due soon · △ due soon</div>
+              <div className="idx-legend">▲ important & due soon · △ due soon · press 1 to fly to ▲</div>
             )}
           </div>
         )}
@@ -1816,7 +1911,7 @@ export default function Orrery() {
           {dbgRec && (
             <>
               <div className="dbg-row dbg-sep"><span className="dbg-k">focused planet</span></div>
-              <div className="dbg-row"><span className="dbg-k">R</span> {dbgRec.R.toFixed(2)} · <span className="dbg-k">ring</span> {dbgRec.ring ? "yes" : "no"}</div>
+              <div className="dbg-row"><span className="dbg-k">R</span> {dbgRec.R.toFixed(2)}</div>
               <div className="dbg-row"><span className="dbg-k">orbit r</span> {dbgRec.orbitRadius.toFixed(1)} · <span className="dbg-k">θ</span> {((dbgRec.orbitAngle * 180 / Math.PI) % 360).toFixed(1)}° · <span className="dbg-k">v</span> {dbgRec.orbitSpeed.toFixed(5)}</div>
               <div className="dbg-row"><span className="dbg-k">chunks</span> {dbgRec.chunks.length} · <span className="dbg-k">dust</span> {dbgRec.dust.length}</div>
               <div className="dbg-row"><span className="dbg-k">pos</span> {v3(dbgRec.group.position)}</div>
@@ -1980,6 +2075,10 @@ const css = `
   color: var(--ink-dim); text-shadow: 0 0 6px rgba(120,150,255,0.5);
   white-space: nowrap; will-change: transform;
 }
+/* severity tint mirrors the dust cluster's color; the ▲/△ glyph carries the
+   same rank by shape for color-blind users */
+.task-label.q1 { color: #ffab66; opacity: 1; font-size: 11.5px; text-shadow: 0 0 8px rgba(255,171,102,0.5); }
+.task-label.q3 { color: #e8dc8a; text-shadow: 0 0 6px rgba(232,220,138,0.4); }
 .hud { position: absolute; z-index: 5; }
 .tip {
   position: absolute; z-index: 6; pointer-events: none;
