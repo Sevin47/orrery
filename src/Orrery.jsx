@@ -63,22 +63,39 @@ function orbitSpeedFor(radius) {
   return ORBIT_ANGULAR_K / Math.sqrt(radius);
 }
 
+// Scroll/pinch-to-zoom clamps — a multiplier on the existing camera-distance
+// formula for each view mode, not a separate camera system. Trackpad pinch
+// arrives as wheel events with ctrlKey set and much larger deltaY, hence the
+// separate (smaller) sensitivity for that case.
+const PLANET_ZOOM_MIN = 0.5;
+const PLANET_ZOOM_MAX = 2.2;
+const GALAXY_ZOOM_MIN = 0.55;
+const GALAXY_ZOOM_MAX = 1.8;
+const ZOOM_WHEEL_SENSITIVITY = 0.0016;
+const ZOOM_PINCH_SENSITIVITY = 0.012;
+
 // Returns orbit descriptors {radius, y, phase} per project — the star-relative
 // circular path each planet's group.position is driven from every frame (see
 // the animate loop), rather than a one-time static position.
+// Sunflower/Fibonacci-disc packing: radius grows with sqrt of cumulative
+// footprint AREA rather than a linear cumulative sum of radii. For N
+// similar-sized planets that's O(sqrt(N)) instead of O(N) — at 100+ projects
+// the old linear sum pushed galaxyExtent into the thousands of units, far
+// past any distance the camera could actually reach. The golden-angle phase
+// spacing (ga) already gives good angular distribution and is unchanged.
+const GALAXY_PACK_K = 2.4;
 function computeLayout(projects) {
   const ga = 2.39996;
   const orbits = [];
-  let orbitR = STAR_CLEARANCE; // every planet orbits the central star — none sit at the origin anymore
-  let prevR = 0;
+  let area = 0;
   for (let i = 0; i < projects.length; i++) {
     const R = radiusFor(projects[i]);
-    const gap = 8; // flat breathing room on top of the size-scaled clearance below
-    orbitR = orbitR + (prevR + R) * PLANET_VISUAL_SPREAD + gap;
+    const footprint = R * PLANET_VISUAL_SPREAD + 4; // local footprint incl. breathing room
+    area += footprint * footprint;
+    const orbitR = STAR_CLEARANCE + GALAXY_PACK_K * Math.sqrt(area);
     const y = Math.sin(i * 0.27 + 0.6) * (2.6 + R * 0.35);
     const phase = i * ga;
     orbits.push({ radius: orbitR, y, phase });
-    prevR = R;
   }
   return orbits;
 }
@@ -196,13 +213,17 @@ function glowTexture(rgb = "160,190,255") {
   return t;
 }
 
-/* ---------------- planet construction ---------------- */
-function buildPlanetRecord(project, orbit) {
+/* ---------------- planet construction ----------------
+ * Split into a cheap "shell" (always built, for every project, even at
+ * 100+ concurrent planets) and an expensive "detail" layer (full per-vertex
+ * terrain + task-chunk bucketing + stardust) that's only ever attached to
+ * whichever single project is currently focused. The shell's low-poly
+ * impostor mesh is what galaxy view actually renders for everyone else. */
+function buildPlanetShell(project, orbit) {
   const pal = paletteFor(project);
   const rng = mulberry32(strHash(project.id));
   const R = radiusFor(project);
   const doneTasks = project.tasks.filter((t) => t.done);
-  const openTasks = project.tasks.filter((t) => !t.done);
   const group = new THREE.Group();
   group.position.set(
     Math.cos(orbit.phase) * orbit.radius,
@@ -211,7 +232,57 @@ function buildPlanetRecord(project, orbit) {
   );
   const spin = new THREE.Group();
   group.add(spin);
-  const chunks = [];
+
+  // cheap galaxy-view impostor — a low-poly solid-color sphere standing in
+  // for the full terrain mesh. Hidden (not removed) while detail is attached.
+  const impostorR = doneTasks.length ? R : 0.85;
+  const impostorGeo = new THREE.IcosahedronGeometry(impostorR, 2);
+  const impostorMat = new THREE.MeshStandardMaterial({
+    color: new THREE.Color().setHSL(pal.hue, pal.sat, 0.4),
+    emissive: pal.glow, emissiveIntensity: doneTasks.length ? 0.22 : 0.5,
+    roughness: 0.7, metalness: 0.08,
+  });
+  const impostor = new THREE.Mesh(impostorGeo, impostorMat);
+  spin.add(impostor);
+
+  // atmosphere glow
+  const atmo = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: glowTexture(`${Math.round(pal.glow.r * 255)},${Math.round(pal.glow.g * 255)},${Math.round(pal.glow.b * 255)}`),
+    transparent: true, opacity: doneTasks.length ? 0.5 : 0.32,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  }));
+  const aScale = (doneTasks.length ? R : 0.9) * 4.6;
+  atmo.scale.set(aScale, aScale, 1);
+  group.add(atmo);
+
+  // invisible galaxy-level click sphere
+  const hit = new THREE.Mesh(
+    new THREE.SphereGeometry(Math.max(R, 1.1) + 0.8, 10, 10),
+    new THREE.MeshBasicMaterial({ visible: false })
+  );
+  hit.userData.projectId = project.id;
+  group.add(hit);
+
+  return {
+    group, spin, impostor, chunks: [], dust: [], atmo, ring: null, hit,
+    R, pal, sig: signature(project), detailBuilt: false,
+    explode: 0, spinAngle: Math.random() * Math.PI * 2,
+    spinSpeed: 0.05 + rng() * 0.05,
+    orbitRadius: orbit.radius, orbitY: orbit.y, orbitAngle: orbit.phase,
+    orbitSpeed: orbitSpeedFor(orbit.radius),
+  };
+}
+
+function attachPlanetDetail(rec, project) {
+  if (rec.detailBuilt) return;
+  const pal = rec.pal;
+  const rng = mulberry32(strHash(project.id));
+  const R = rec.R;
+  const doneTasks = project.tasks.filter((t) => t.done);
+  const openTasks = project.tasks.filter((t) => !t.done);
+  const spin = rec.spin;
+  const group = rec.group;
+  const chunks = rec.chunks;
 
   const bandPhase = rng() * Math.PI * 2;
   const banding = 2.5 + rng() * 3;
@@ -348,20 +419,9 @@ function buildPlanetRecord(project, orbit) {
     });
   }
 
-  // atmosphere glow
-  const atmo = new THREE.Sprite(new THREE.SpriteMaterial({
-    map: glowTexture(`${Math.round(pal.glow.r * 255)},${Math.round(pal.glow.g * 255)},${Math.round(pal.glow.b * 255)}`),
-    transparent: true, opacity: doneTasks.length ? 0.5 : 0.32,
-    blending: THREE.AdditiveBlending, depthWrite: false,
-  }));
-  const aScale = (doneTasks.length ? R : 0.9) * 4.6;
-  atmo.scale.set(aScale, aScale, 1);
-  group.add(atmo);
-
   // rings for mature worlds — not every eligible planet gets one; a dedicated,
   // independent seed (rather than the shared `rng`) decides per-project so
   // this doesn't perturb any other deterministic terrain/color values.
-  let ring = null;
   if (doneTasks.length >= 8) {
     const ringRng = mulberry32(strHash(project.id + "|ring"));
     if (ringRng() < 0.5) {
@@ -370,14 +430,15 @@ function buildPlanetRecord(project, orbit) {
         color: pal.accent, side: THREE.DoubleSide, transparent: true, opacity: 0.20,
         blending: THREE.AdditiveBlending, depthWrite: false,
       });
-      ring = new THREE.Mesh(rg, rm);
+      const ring = new THREE.Mesh(rg, rm);
       ring.rotation.x = Math.PI / 2 - 0.35 - rng() * 0.3;
       group.add(ring);
+      rec.ring = ring;
     }
   }
 
   // stardust clusters for open tasks — soft round cloud-puffs, not hard squares
-  const dust = [];
+  const dust = rec.dust;
   const dustMap = glowTexture(`${Math.round(pal.accent.r * 255)},${Math.round(pal.accent.g * 255)},${Math.round(pal.accent.b * 255)}`);
   openTasks.forEach((task, i) => {
     const trng = mulberry32(strHash(task.id));
@@ -426,24 +487,30 @@ function buildPlanetRecord(project, orbit) {
     });
   });
 
-  // invisible galaxy-level click sphere
-  const hit = new THREE.Mesh(
-    new THREE.SphereGeometry(Math.max(R, 1.1) + 0.8, 10, 10),
-    new THREE.MeshBasicMaterial({ visible: false })
-  );
-  hit.userData.projectId = project.id;
-  group.add(hit);
-
-  return {
-    group, spin, chunks, dust, atmo, ring, hit,
-    R, pal, sig: signature(p2s(project)),
-    explode: 0, spinAngle: Math.random() * Math.PI * 2,
-    spinSpeed: 0.05 + rng() * 0.05,
-    orbitRadius: orbit.radius, orbitY: orbit.y, orbitAngle: orbit.phase,
-    orbitSpeed: orbitSpeedFor(orbit.radius),
-  };
+  rec.impostor.visible = false;
+  rec.detailBuilt = true;
 }
-function p2s(p) { return p; }
+
+function disposeThreeObject(o) {
+  o.traverse((n) => {
+    if (n.geometry) n.geometry.dispose();
+    if (n.material) {
+      if (n.material.map) n.material.map.dispose();
+      n.material.dispose();
+    }
+  });
+}
+
+function detachPlanetDetail(rec) {
+  if (!rec.detailBuilt) return;
+  rec.chunks.forEach((c) => { rec.spin.remove(c.mesh); disposeThreeObject(c.mesh); });
+  rec.dust.forEach((d) => { rec.group.remove(d.cluster); disposeThreeObject(d.cluster); });
+  if (rec.ring) { rec.group.remove(rec.ring); disposeThreeObject(rec.ring); rec.ring = null; }
+  rec.chunks = [];
+  rec.dust = [];
+  rec.impostor.visible = true;
+  rec.detailBuilt = false;
+}
 
 function disposeRecord(rec) {
   rec.group.traverse((o) => {
@@ -460,6 +527,8 @@ export default function Orrery() {
   const mountRef = useRef(null);
   const worldRef = useRef(null);
   const projectsRef = useRef([]);
+  const galaxyLabelLayerRef = useRef(null); // plain DOM labels for planet names, updated imperatively per-frame
+  const taskLabelLayerRef = useRef(null); // plain DOM labels for task names on the focused planet
   const [projects, setProjects] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [view, setView] = useState({ mode: "galaxy", projectId: null });
@@ -663,11 +732,10 @@ export default function Orrery() {
     const mount = mountRef.current;
     if (!mount) return;
     const scene = new THREE.Scene();
-    // Lowered from 0.0075: planets now space out much further apart as they grow
-    // (see PLANET_VISUAL_SPREAD), and the old density fogged out most of the
-    // galaxy overview once a few large planets pushed the framing distance up.
-    scene.fog = new THREE.FogExp2(0x04060f, 0.0028);
-    const camera = new THREE.PerspectiveCamera(52, mount.clientWidth / mount.clientHeight, 0.1, 600);
+    // Far plane raised from 600: at 100+ planets the packed layout extent plus
+    // a fully zoomed-out free-orbit camera can both sit well past the old
+    // limit, which would clip distant planets out of existence entirely.
+    const camera = new THREE.PerspectiveCamera(52, mount.clientWidth / mount.clientHeight, 0.1, 3000);
     camera.position.set(0, 34, 96);
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
     renderer.setClearColor(0x04060f, 1);
@@ -675,8 +743,8 @@ export default function Orrery() {
     renderer.setSize(mount.clientWidth, mount.clientHeight);
     mount.appendChild(renderer.domElement);
 
-    scene.add(new THREE.AmbientLight(0x30395c, 1.1));
-    const rim = new THREE.PointLight(0x6a7dff, 0.5, 200);
+    scene.add(new THREE.AmbientLight(0x30395c, 1.8));
+    const rim = new THREE.PointLight(0x6a7dff, 0.9, 200);
     rim.position.set(-40, -10, -30);
     scene.add(rim);
 
@@ -695,7 +763,7 @@ export default function Orrery() {
     }));
     sunGlow.scale.set(STAR_RADIUS * 6, STAR_RADIUS * 6, 1);
     scene.add(sunGlow);
-    const sunLight = new THREE.PointLight(0xfff2df, 2.4, 0, 1.15);
+    const sunLight = new THREE.PointLight(0xfff2df, 3.2, 0, 1.15);
     sunLight.position.set(0, 0, 0);
     scene.add(sunLight);
 
@@ -725,21 +793,6 @@ export default function Orrery() {
     }));
     scene.add(stars);
 
-    // nebulas
-    const nebCols = ["70,90,200", "120,80,190", "60,140,180", "40,60,150"];
-    const nebulas = [];
-    for (let i = 0; i < 5; i++) {
-      const spr = new THREE.Sprite(new THREE.SpriteMaterial({
-        map: glowTexture(nebCols[i % nebCols.length]),
-        transparent: true, opacity: 0.16, blending: THREE.AdditiveBlending, depthWrite: false,
-      }));
-      const s = 90 + Math.random() * 120;
-      spr.scale.set(s, s * (0.5 + Math.random() * 0.5), 1);
-      spr.position.set((Math.random() - 0.5) * 180, (Math.random() - 0.5) * 70, -80 - Math.random() * 120);
-      scene.add(spr);
-      nebulas.push(spr);
-    }
-
     const world = {
       scene, camera, renderer,
       planets: new Map(),
@@ -753,6 +806,12 @@ export default function Orrery() {
       clock: new THREE.Clock(),
       hovered: null,
       orbit: null, // {theta, alpha, dragging} — user-controlled rotation around focused planet
+      zoom: { planet: 1, galaxy: 1 }, // user-controlled distance multiplier, kept per mode
+      galaxyBase: { radius: 46 }, // unzoomed galaxy-view orbit radius; zoom/orbit scale off this
+      // free-orbit camera around the star in galaxy view, same spherical-coordinate
+      // model as planet-mode `orbit` above, just targeting the origin instead of
+      // a planet. Initial alpha matches the old fixed establishing-shot angle.
+      galaxyOrbit: { theta: 0, alpha: Math.atan2(14, 44), dragging: false },
     };
     worldRef.current = world;
 
@@ -763,6 +822,30 @@ export default function Orrery() {
       renderer.setSize(w, h);
     };
     window.addEventListener("resize", onResize);
+
+    // Scroll-to-zoom (and trackpad pinch, which browsers report as wheel
+    // events with ctrlKey set and larger deltaY). Native listener, not React's
+    // onWheel — React 17+ attaches wheel as a passive listener at the root,
+    // so preventDefault() inside a JSX onWheel handler silently does nothing.
+    const onWheel = (e) => {
+      e.preventDefault();
+      const mode = viewRef.current.mode;
+      if (mode === "planet") {
+        const sens = e.ctrlKey ? ZOOM_PINCH_SENSITIVITY : ZOOM_WHEEL_SENSITIVITY;
+        world.zoom.planet = clamp(world.zoom.planet * (1 + e.deltaY * sens), PLANET_ZOOM_MIN, PLANET_ZOOM_MAX);
+      } else if (mode === "galaxy") {
+        const sens = e.ctrlKey ? ZOOM_PINCH_SENSITIVITY : ZOOM_WHEEL_SENSITIVITY;
+        world.zoom.galaxy = clamp(world.zoom.galaxy * (1 + e.deltaY * sens), GALAXY_ZOOM_MIN, GALAXY_ZOOM_MAX);
+        // camTarget itself is recomputed every frame in the animate loop from
+        // galaxyOrbit + this zoom factor — nothing more to do here.
+      }
+    };
+    mount.addEventListener("wheel", onWheel, { passive: false });
+
+    const labelVec = new THREE.Vector3(); // scratch, reused every frame for projection
+    // How many planets before galaxy labels start thinning by camera distance
+    // instead of all showing at once — small galaxies never hit this.
+    const LABEL_ALWAYS_COUNT = 18;
 
     let raf;
     const animate = () => {
@@ -849,7 +932,7 @@ export default function Orrery() {
         if (rec) {
           const baseHeight = rec.R * 0.9;
           const baseDist = rec.R * 3.4 + 4.2;
-          const radius = Math.hypot(baseHeight, baseDist);
+          const radius = Math.hypot(baseHeight, baseDist) * world.zoom.planet;
           const alpha = world.orbit.alpha;
           const theta = world.orbit.theta;
           const horizontalDist = radius * Math.cos(alpha);
@@ -863,10 +946,25 @@ export default function Orrery() {
         }
       }
 
-      // camera glide — galaxy view now holds a static wide framing once eased
-      // in (no mouse-parallax drift), so the only motion on screen is the
-      // planets themselves orbiting the star.
-      if (v.mode === "planet" && world.orbit?.dragging) {
+      // free-orbit around the star (user-controlled via drag), same spherical
+      // model as the planet-mode block above, just targeting the origin at a
+      // zoom-scaled radius instead of a planet's position.
+      if (v.mode === "galaxy" && world.galaxyOrbit) {
+        const radius = world.galaxyBase.radius * world.zoom.galaxy;
+        const alpha = world.galaxyOrbit.alpha;
+        const theta = world.galaxyOrbit.theta;
+        const horizontalDist = radius * Math.cos(alpha);
+        world.camTarget.set(
+          horizontalDist * Math.sin(theta),
+          radius * Math.sin(alpha),
+          horizontalDist * Math.cos(theta)
+        );
+        world.lookTarget.set(0, 0, 0);
+      }
+
+      // camera glide — instant follow while actively dragging (either mode),
+      // eased lerp otherwise so clicks/zoom/focus changes glide into place.
+      if ((v.mode === "planet" && world.orbit?.dragging) || (v.mode === "galaxy" && world.galaxyOrbit?.dragging)) {
         world.camPos.set(world.camTarget.x, world.camTarget.y, world.camTarget.z);
       } else {
         world.camPos.lerp(world.camTarget, Math.min(1, dt * 2.2));
@@ -876,12 +974,69 @@ export default function Orrery() {
       camera.lookAt(world.look);
 
       renderer.render(scene, camera);
+
+      // planet-name labels — plain DOM nodes projected to screen space each
+      // frame. Past LABEL_ALWAYS_COUNT planets, thin by distance from camera
+      // (the near hemisphere lights up, far side fades) rather than showing
+      // every name at once, which would just read as an overlapping wall of
+      // text at 100+ planets.
+      const galaxyLayer = galaxyLabelLayerRef.current;
+      if (galaxyLayer) {
+        const showGalaxyLabels = v.mode === "galaxy";
+        const thinning = world.planets.size > LABEL_ALWAYS_COUNT;
+        const camRadius = world.galaxyBase.radius * world.zoom.galaxy;
+        for (const [, rec] of world.planets) {
+          const el = rec.label;
+          if (!el) continue;
+          if (!showGalaxyLabels) { el.style.display = "none"; continue; }
+          labelVec.copy(rec.group.position).project(camera);
+          if (labelVec.z > 1 || labelVec.z < -1) { el.style.display = "none"; continue; }
+          let opacity = 1;
+          if (thinning) {
+            const dist = camera.position.distanceTo(rec.group.position);
+            const near = camRadius * 0.55, far = camRadius * 1.35;
+            opacity = clamp(1 - (dist - near) / (far - near), 0, 1);
+          }
+          if (opacity <= 0.03) { el.style.display = "none"; continue; }
+          const x = (labelVec.x * 0.5 + 0.5) * mount.clientWidth;
+          const y = (-labelVec.y * 0.5 + 0.5) * mount.clientHeight;
+          el.style.display = "block";
+          el.style.opacity = opacity.toFixed(2);
+          el.style.transform = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px)`;
+        }
+      }
+
+      // task-name labels — same projection, scoped to the focused planet's
+      // own chunks/dust, tracking their live (possibly still-exploding or
+      // still-orbiting) world position rather than a fixed offset.
+      const taskLayer = taskLabelLayerRef.current;
+      if (taskLayer) {
+        const rec = v.mode === "planet" ? world.planets.get(v.projectId) : null;
+        if (rec?.taskLabels) {
+          const explodeAmt = rec.explode * (rec.R * 0.55 + 0.45); // matches the chunk-scatter math above
+          for (const tl of rec.taskLabels) {
+            if (tl.kind === "chunk") {
+              labelVec.copy(tl.dir).multiplyScalar(rec.R + explodeAmt);
+              rec.spin.localToWorld(labelVec);
+            } else {
+              tl.cluster.getWorldPosition(labelVec);
+            }
+            labelVec.project(camera);
+            if (labelVec.z > 1 || labelVec.z < -1) { tl.el.style.display = "none"; continue; }
+            const x = (labelVec.x * 0.5 + 0.5) * mount.clientWidth;
+            const y = (-labelVec.y * 0.5 + 0.5) * mount.clientHeight;
+            tl.el.style.display = "block";
+            tl.el.style.transform = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px)`;
+          }
+        }
+      }
     };
     animate();
 
     return () => {
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", onResize);
+      mount.removeEventListener("wheel", onWheel);
       for (const [, rec] of world.planets) disposeRecord(rec);
       starGeo.dispose();
       sunGeo.dispose(); sunMat.dispose();
@@ -892,6 +1047,39 @@ export default function Orrery() {
     };
   }, []);
 
+  // task-name labels for a focused planet's chunks/dust — plain DOM nodes,
+  // rebuilt any time that planet's detail mesh is (re)built: on first focus,
+  // and again whenever a task completes/changes while it's still focused.
+  const clearTaskLabels = (rec) => {
+    if (!rec.taskLabels) return;
+    rec.taskLabels.forEach((tl) => tl.el.remove());
+    rec.taskLabels = null;
+  };
+  const buildTaskLabels = (rec) => {
+    const layer = taskLabelLayerRef.current;
+    if (!layer || rec.taskLabels) return;
+    rec.taskLabels = [];
+    rec.chunks.forEach((c) => {
+      if (!c.task) return;
+      const el = document.createElement("div");
+      el.className = "task-label";
+      el.textContent = c.task.title;
+      layer.appendChild(el);
+      // chunk.mesh's own origin sits at the planet's center (its geometry's
+      // vertices carry the actual surface offsets, not the mesh transform) —
+      // dir is the chunk's surface direction, needed to anchor the label at
+      // the visible fragment rather than the planet's core.
+      rec.taskLabels.push({ el, kind: "chunk", dir: c.dir });
+    });
+    rec.dust.forEach((d) => {
+      const el = document.createElement("div");
+      el.className = "task-label";
+      el.textContent = d.task.title;
+      layer.appendChild(el);
+      rec.taskLabels.push({ el, kind: "dust", cluster: d.cluster });
+    });
+  };
+
   /* ---------- scene sync ---------- */
   useEffect(() => {
     const world = worldRef.current;
@@ -901,6 +1089,8 @@ export default function Orrery() {
       if (!keep.has(id)) {
         world.scene.remove(rec.group);
         disposeRecord(rec);
+        rec.label?.remove();
+        clearTaskLabels(rec);
         world.planets.delete(id);
       }
     }
@@ -910,26 +1100,45 @@ export default function Orrery() {
       const orbit = orbits[i];
       outer = Math.max(outer, Math.hypot(orbit.radius, orbit.y) + radiusFor(p));
       const sig = signature(p);
+      const isFocused = viewRef.current.mode === "planet" && viewRef.current.projectId === p.id;
       let rec = world.planets.get(p.id);
       if (rec && rec.sig !== sig) {
         const explode = rec.explode, spinAngle = rec.spinAngle, orbitAngle = rec.orbitAngle;
         world.scene.remove(rec.group);
         disposeRecord(rec);
+        rec.label?.remove();
+        clearTaskLabels(rec);
         rec = null;
-        const fresh = buildPlanetRecord(p, orbit);
+        const fresh = buildPlanetShell(p, orbit);
         fresh.explode = explode;
         fresh.spinAngle = spinAngle;
         fresh.orbitAngle = orbitAngle; // keep revolving smoothly through a rebuild, don't snap back to phase
         world.scene.add(fresh.group);
         world.planets.set(p.id, fresh);
+        if (galaxyLabelLayerRef.current) {
+          fresh.label = document.createElement("div");
+          fresh.label.className = "planet-label";
+          fresh.label.textContent = p.name;
+          galaxyLabelLayerRef.current.appendChild(fresh.label);
+        }
+        if (isFocused) { attachPlanetDetail(fresh, p); buildTaskLabels(fresh); } // e.g. completing a task on the focused planet
       } else if (!rec) {
-        const fresh = buildPlanetRecord(p, orbit);
+        const fresh = buildPlanetShell(p, orbit);
         world.scene.add(fresh.group);
         world.planets.set(p.id, fresh);
+        if (galaxyLabelLayerRef.current) {
+          fresh.label = document.createElement("div");
+          fresh.label.className = "planet-label";
+          fresh.label.textContent = p.name;
+          galaxyLabelLayerRef.current.appendChild(fresh.label);
+        }
+        if (isFocused) attachPlanetDetail(fresh, p);
       } else {
         // signature unchanged, but the layout may have shifted (e.g. an earlier
         // planet resized) — adopt the new radius/y, keep the current angle so
-        // motion stays continuous instead of jumping.
+        // motion stays continuous instead of jumping. Also catch a rename,
+        // which doesn't touch the task-signature so wouldn't otherwise refresh.
+        if (rec.label && rec.label.textContent !== p.name) rec.label.textContent = p.name;
         rec.orbitRadius = orbit.radius;
         rec.orbitY = orbit.y;
         rec.orbitSpeed = orbitSpeedFor(orbit.radius);
@@ -938,31 +1147,23 @@ export default function Orrery() {
     world.galaxyExtent = outer;
   }, [projects]);
 
-  /* ---------- camera targets (galaxy) ---------- */
+  /* ---------- camera base radius (galaxy) ---------- */
+  // Only the base orbit RADIUS is computed here — the actual camTarget is
+  // derived every frame in the animate loop from this radius combined with
+  // the user's free-orbit theta/alpha and zoom, the same split planet-mode
+  // already uses (baseDist here, orbit angles in the render loop).
   useEffect(() => {
     const world = worldRef.current;
     if (!world) return;
     if (view.mode === "galaxy") {
-      const n = projects.length;
-      const far = Math.max(30 + n * 6.5, (world.galaxyExtent || 20) * 1.7);
-      // Clamp lowered from 420: at this fog density, 420 units out is already
-      // ~69% fogged — fine for the rare planet that reaches it, but once a
-      // galaxy is big enough to NEED the clamp (dozens of projects, or a few
-      // heavy stress-test batches), the camera sits there permanently and
-      // everything, including the star, reads as washed out. 260 caps worst-
-      // case fog around ~52% instead. Small/typical galaxies are unaffected —
-      // they were already resolving well under either ceiling.
-      const camZ = Math.min(260, far);
-      // Y used to scale off the raw, unbounded galaxyExtent while Z was capped
-      // at 420 — with enough projects (extent grows without limit as more are
-      // added) that made the camera climb to an absurd height independently
-      // of how far back it actually was, producing a near-overhead view into
-      // fog instead of a wide establishing shot. 0.0706 reproduces the old
-      // ratio (extent*0.12 when Z == extent*1.7, the un-clamped case) but off
-      // the actual clamped distance, so it stays proportionate at any scale.
-      const camY = 12 + n * 1.5 + camZ * 0.0706;
-      world.camTarget.set(0, camY, camZ);
-      world.lookTarget.set(0, 0, 0);
+      // Distance driven by the actual packed layout extent (which now grows
+      // sub-linearly with project count post-repacking, see computeLayout),
+      // not a separate linear-in-n term — capped so a big galaxy (dozens of
+      // projects, stress-test batches) doesn't push the camera back
+      // indefinitely once the establishing shot stops gaining from it.
+      const far = Math.max(30, (world.galaxyExtent || 20) * 1.6);
+      const radius = Math.min(320, far);
+      world.galaxyBase.radius = radius;
     }
   }, [view.mode, projects]);
 
@@ -970,12 +1171,26 @@ export default function Orrery() {
   useEffect(() => {
     const world = worldRef.current;
     if (!world) return;
+    // Only the focused project needs its expensive detail mesh built — every
+    // other planet reverts to its cheap galaxy-view impostor. detachPlanetDetail
+    // is a no-op for records that already have no detail attached.
+    for (const [id, rec] of world.planets) {
+      if (!(view.mode === "planet" && id === view.projectId)) {
+        detachPlanetDetail(rec);
+        clearTaskLabels(rec);
+      }
+    }
     if (view.mode === "planet") {
       const rec = world.planets.get(view.projectId);
       const R = rec ? rec.R : 1.5;
       const baseHeight = R * 0.9;
       const baseDist = R * 3.4 + 4.2;
       world.orbit = { theta: 0, alpha: Math.atan2(baseHeight, baseDist), dragging: false };
+      if (rec) {
+        const project = projectsRef.current.find((p) => p.id === view.projectId);
+        if (project) attachPlanetDetail(rec, project);
+        buildTaskLabels(rec);
+      }
     } else {
       world.orbit = null;
     }
@@ -1022,13 +1237,24 @@ export default function Orrery() {
     }
   }, []);
 
-  /* ---------- arrow-key planet cycling ---------- */
+  /* ---------- arrow-key planet cycling / escape-to-galaxy ---------- */
   useEffect(() => {
     const onKeyDown = (e) => {
-      if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
       const tag = document.activeElement?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
       if (intakeOpenRef.current) return;
+
+      if (e.key === "Escape") {
+        if (viewRef.current.mode === "planet") {
+          e.preventDefault();
+          setView({ mode: "galaxy", projectId: null });
+          setSelected(null);
+          setHoverTip(null);
+        }
+        return;
+      }
+
+      if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
       const ps = projectsRef.current;
       if (!ps.length) return;
       e.preventDefault();
@@ -1052,9 +1278,12 @@ export default function Orrery() {
     drag.moved = false;
     drag.startX = e.clientX;
     drag.startY = e.clientY;
-    if (world?.orbit) {
+    if (viewRef.current.mode === "planet" && world?.orbit) {
       drag.startTheta = world.orbit.theta;
       drag.startAlpha = world.orbit.alpha;
+    } else if (viewRef.current.mode === "galaxy" && world?.galaxyOrbit) {
+      drag.startTheta = world.galaxyOrbit.theta;
+      drag.startAlpha = world.galaxyOrbit.alpha;
     }
     try { mountRef.current?.setPointerCapture?.(e.pointerId); } catch (err) { /* best-effort */ }
   }, []);
@@ -1065,6 +1294,7 @@ export default function Orrery() {
     const drag = dragRef.current;
     drag.down = false;
     if (world?.orbit) world.orbit.dragging = false;
+    if (world?.galaxyOrbit) world.galaxyOrbit.dragging = false;
     if (!drag.moved) {
       selectFromHit(pick(e.clientX, e.clientY));
     }
@@ -1090,6 +1320,10 @@ export default function Orrery() {
         world.orbit.dragging = true;
         world.orbit.theta = drag.startTheta - dx * ORBIT_SENSITIVITY;
         world.orbit.alpha = clamp(drag.startAlpha + dy * ORBIT_SENSITIVITY, -ORBIT_ALPHA_LIMIT, ORBIT_ALPHA_LIMIT);
+      } else if (viewRef.current.mode === "galaxy" && world.galaxyOrbit) {
+        world.galaxyOrbit.dragging = true;
+        world.galaxyOrbit.theta = drag.startTheta - dx * ORBIT_SENSITIVITY;
+        world.galaxyOrbit.alpha = clamp(drag.startAlpha + dy * ORBIT_SENSITIVITY, -ORBIT_ALPHA_LIMIT, ORBIT_ALPHA_LIMIT);
       }
       mount.style.cursor = "grabbing";
       setHoverTip(null);
@@ -1097,7 +1331,7 @@ export default function Orrery() {
     }
 
     const hit = pick(e.clientX, e.clientY);
-    mount.style.cursor = hit ? "pointer" : (viewRef.current.mode === "planet" ? "grab" : "default");
+    mount.style.cursor = hit ? "pointer" : "grab";
     // hover glow on chunks
     for (const [, rec] of world.planets) {
       rec.chunks.forEach((c) => {
@@ -1269,6 +1503,8 @@ export default function Orrery() {
         onPointerMove={onCanvasMove}
         onPointerUp={onCanvasPointerUp}
       />
+      <div ref={galaxyLabelLayerRef} className="label-layer" />
+      <div ref={taskLabelLayerRef} className="label-layer" />
       {hoverTip && (
         <div className="tip" style={{ left: hoverTip.x + 14, top: hoverTip.y - 10 }}>
           {hoverTip.label}
@@ -1325,7 +1561,7 @@ export default function Orrery() {
           <div className="ph-hint">
             {focusProject.tasks.length === 0
               ? "A newborn core. Add tasks to give it matter. · ← → to switch worlds"
-              : "Tap a fragment to recall its work · tap orbiting stardust to view open tasks · drag to rotate · ← → to switch worlds"}
+              : "Tap a fragment to recall its work · tap orbiting stardust to view open tasks · drag to rotate · scroll to zoom · ← → to switch worlds"}
           </div>
         </div>
       )}
@@ -1416,6 +1652,7 @@ export default function Orrery() {
           <div className="dbg-row"><span className="dbg-k">star</span> R={STAR_RADIUS} @ origin</div>
           <div className="dbg-row"><span className="dbg-k">camera</span> {v3(dbgWorld?.camPos)}</div>
           <div className="dbg-row"><span className="dbg-k">cam target</span> {v3(dbgWorld?.camTarget)}</div>
+          <div className="dbg-row"><span className="dbg-k">zoom</span> planet {dbgWorld?.zoom.planet.toFixed(2)} · galaxy {dbgWorld?.zoom.galaxy.toFixed(2)}</div>
           {dbgRec && (
             <>
               <div className="dbg-row dbg-sep"><span className="dbg-k">focused planet</span></div>
@@ -1559,6 +1796,19 @@ const css = `
   font-size: 15px;
 }
 .canvas-mount { position: absolute; inset: 0; }
+.label-layer { position: absolute; inset: 0; z-index: 4; pointer-events: none; overflow: hidden; }
+.planet-label {
+  position: absolute; left: 0; top: 0; pointer-events: none;
+  font-family: 'Cormorant Garamond', serif; font-size: 13px; letter-spacing: 0.02em;
+  color: var(--ink-dim); text-shadow: 0 0 8px rgba(120,150,255,0.6);
+  white-space: nowrap; will-change: transform, opacity;
+}
+.task-label {
+  position: absolute; left: 0; top: 0; pointer-events: none;
+  font-family: 'Cormorant Garamond', serif; font-size: 11px; opacity: 0.85;
+  color: var(--ink-dim); text-shadow: 0 0 6px rgba(120,150,255,0.5);
+  white-space: nowrap; will-change: transform;
+}
 .hud { position: absolute; z-index: 5; }
 .tip {
   position: absolute; z-index: 6; pointer-events: none;
