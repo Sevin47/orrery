@@ -126,6 +126,64 @@ function radiusFor(project) {
 function signature(p) {
   return p.id + "|" + p.tasks.map((t) => t.id + (t.done ? "1" : "0")).join(",");
 }
+
+/* ---------------- Eisenhower triage ----------------
+ * Quadrants live on TASKS (a maintenance world can host one fire-drill task
+ * without mislabeling the whole planet); planets aggregate their open tasks.
+ * Urgency is DERIVED from the due date, never asked — it's a fact about time,
+ * and a manually-set flag goes stale. Importance is the one human judgment,
+ * asked once at intake (defaulting from the project's archetype) and
+ * editable from the task detail panel. Absent `important` means true:
+ * existing saved tasks were presumably worth tracking, and the toggle
+ * exists to demote, not to nag. */
+const URGENT_WINDOW_DAYS = 3;
+function taskImportant(t) {
+  return t.important !== false;
+}
+function taskUrgent(t) {
+  if (!t.due || t.done) return false;
+  // same end-of-day convention as overdue(): a task due today is urgent all day
+  const due = new Date(t.due + "T23:59:59");
+  const horizon = new Date(Date.now() + URGENT_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+  return due <= horizon;
+}
+function taskQuadrant(t) {
+  return taskImportant(t)
+    ? (taskUrgent(t) ? "q1" : "q2")
+    : (taskUrgent(t) ? "q3" : "q4");
+}
+function projectPriority(p) {
+  let q1 = 0, q3 = 0;
+  for (const t of p.tasks) {
+    if (t.done) continue;
+    const q = taskQuadrant(t);
+    if (q === "q1") q1++;
+    else if (q === "q3") q3++;
+  }
+  return { q1, q3 };
+}
+// Project archetypes — the user's five real work categories. This slice they
+// only drive intake pre-fills (default importance, and exec fire drills
+// pre-filling due = today so capture stays title + Enter); later slices may
+// hang dust behavior or triage ordering off them.
+const ARCHETYPES = [
+  { key: "general", label: "General", importantDefault: true, dueToday: false },
+  { key: "exec", label: "Executive Ad-Hoc", importantDefault: true, dueToday: true },
+  { key: "flagship", label: "Flagship Deliverable", importantDefault: true, dueToday: false },
+  // individual routine maintenance tasks are the classic "the program matters,
+  // each task doesn't" case — overdue ones read Q3 (contain), not false-alarm
+  // Q1; one tap promotes exceptions.
+  { key: "maintenance", label: "Database Maintenance", importantDefault: false, dueToday: false },
+  { key: "sprint", label: "Application Sprint", importantDefault: true, dueToday: false },
+  { key: "governance", label: "Governance & Compliance", importantDefault: true, dueToday: false },
+];
+function archetypeFor(project) {
+  return ARCHETYPES.find((a) => a.key === project?.archetype) || ARCHETYPES[0];
+}
+function todayISO(offsetDays = 0) {
+  const d = new Date(Date.now() + offsetDays * 24 * 60 * 60 * 1000);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
 function uid() {
   return (crypto?.randomUUID?.() || Date.now() + "-" + Math.random().toString(36).slice(2));
 }
@@ -507,6 +565,23 @@ function disposeThreeObject(o) {
   });
 }
 
+// Re-derives each planet's Eisenhower aggregate (rec.q1Count) and syncs its
+// name label's ▲-badge. Called from scene-sync on every projects change, and
+// hourly — urgency is time-derived, so quadrants flip at day boundaries with
+// no data change at all.
+function refreshPlanetPriorities(world, projects) {
+  for (const p of projects) {
+    const rec = world.planets.get(p.id);
+    if (!rec) continue;
+    rec.q1Count = projectPriority(p).q1;
+    if (rec.label) {
+      const wanted = rec.q1Count > 0 ? `▲${rec.q1Count} · ${p.name}` : p.name;
+      if (rec.label.textContent !== wanted) rec.label.textContent = wanted;
+      rec.label.classList.toggle("q1", rec.q1Count > 0);
+    }
+  }
+}
+
 function detachPlanetDetail(rec) {
   if (!rec.detailBuilt) return;
   rec.chunks.forEach((c) => { rec.spin.remove(c.mesh); disposeThreeObject(c.mesh); });
@@ -575,10 +650,27 @@ export default function Orrery() {
   // form state
   const [fProjName, setFProjName] = useState("");
   const [fProjDesc, setFProjDesc] = useState("");
+  const [fProjArch, setFProjArch] = useState("general");
   const [fTaskProject, setFTaskProject] = useState("");
   const [fTaskTitle, setFTaskTitle] = useState("");
   const [fTaskNotes, setFTaskNotes] = useState("");
   const [fTaskDue, setFTaskDue] = useState("");
+  const [fImportant, setFImportant] = useState(true);
+
+  // archetype-driven intake prefills: picking a world resets the Important
+  // checkbox to that world's default, and exec (fire-drill) worlds pre-fill
+  // due = today so urgent capture stays title + Enter. Runs on world change
+  // only — it never overwrites edits made after the world is chosen. The
+  // just-created-world path can't rely on this effect (projectsRef doesn't
+  // include the new project yet when it fires), so addProject applies the
+  // same prefills itself.
+  useEffect(() => {
+    const proj = projectsRef.current.find((p) => p.id === fTaskProject);
+    if (!proj) return;
+    const arch = archetypeFor(proj);
+    setFImportant(arch.importantDefault);
+    if (arch.dueToday) setFTaskDue(todayISO());
+  }, [fTaskProject]);
 
   /* ---------- persistence (localStorage) ---------- */
   useEffect(() => {
@@ -998,7 +1090,11 @@ export default function Orrery() {
           labelVec.copy(rec.group.position).project(camera);
           if (labelVec.z > 1 || labelVec.z < -1) { el.style.display = "none"; continue; }
           let opacity = 1;
-          if (thinning) {
+          // Q1 planets defeat thinning entirely: at any zoom, the only names
+          // guaranteed readable are the ones that need attention ("fly to me
+          // first"). The ▲-count in the label itself carries the signal by
+          // shape, not color alone.
+          if (thinning && !(rec.q1Count > 0)) {
             const dist = camera.position.distanceTo(rec.group.position);
             const near = camRadius * 0.55, far = camRadius * 1.35;
             opacity = clamp(1 - (dist - near) / (far - near), 0, 1);
@@ -1142,16 +1238,27 @@ export default function Orrery() {
       } else {
         // signature unchanged, but the layout may have shifted (e.g. an earlier
         // planet resized) — adopt the new radius/y, keep the current angle so
-        // motion stays continuous instead of jumping. Also catch a rename,
-        // which doesn't touch the task-signature so wouldn't otherwise refresh.
-        if (rec.label && rec.label.textContent !== p.name) rec.label.textContent = p.name;
+        // motion stays continuous instead of jumping.
         rec.orbitRadius = orbit.radius;
         rec.orbitY = orbit.y;
         rec.orbitSpeed = orbitSpeedFor(orbit.radius);
       }
     });
     world.galaxyExtent = outer;
+    // owns label text (name + ▲-badge) for every planet, including renames —
+    // importance/due edits don't touch signature(), so this unconditional
+    // pass is what keeps triage state fresh without planet rebuilds.
+    refreshPlanetPriorities(world, projects);
   }, [projects]);
+
+  /* ---------- hourly triage refresh (urgency is time-derived) ---------- */
+  useEffect(() => {
+    const id = setInterval(() => {
+      const world = worldRef.current;
+      if (world) refreshPlanetPriorities(world, projectsRef.current);
+    }, 60 * 60 * 1000);
+    return () => clearInterval(id);
+  }, []);
 
   /* ---------- camera base radius (galaxy) ---------- */
   // Only the base orbit RADIUS is computed here — the actual camTarget is
@@ -1383,21 +1490,31 @@ export default function Orrery() {
   const addProject = useCallback(() => {
     const name = fProjName.trim();
     if (!name) return;
-    const p = { id: uid(), name, desc: fProjDesc.trim(), createdAt: Date.now(), tasks: [] };
+    const p = { id: uid(), name, desc: fProjDesc.trim(), archetype: fProjArch, createdAt: Date.now(), tasks: [] };
     setProjects((ps) => [...ps, p]);
-    setFProjName(""); setFProjDesc("");
+    setFProjName(""); setFProjDesc(""); setFProjArch("general");
     setIntakeMode("task");
     setFTaskProject(p.id);
-  }, [fProjName, fProjDesc]);
+    // apply this archetype's task prefills directly — the world-change effect
+    // can't see the new project in projectsRef yet (see its comment)
+    const arch = archetypeFor(p);
+    setFImportant(arch.importantDefault);
+    setFTaskDue(arch.dueToday ? todayISO() : "");
+  }, [fProjName, fProjDesc, fProjArch]);
 
   const addTask = useCallback(() => {
     const title = fTaskTitle.trim();
     if (!title || !fTaskProject) return;
     setProjects((ps) => ps.map((p) => p.id === fTaskProject
-      ? { ...p, tasks: [...p.tasks, { id: uid(), title, notes: fTaskNotes.trim(), due: fTaskDue || null, done: false, createdAt: Date.now(), completedAt: null }] }
+      ? { ...p, tasks: [...p.tasks, { id: uid(), title, notes: fTaskNotes.trim(), due: fTaskDue || null, important: fImportant, done: false, createdAt: Date.now(), completedAt: null }] }
       : p));
-    setFTaskTitle(""); setFTaskNotes(""); setFTaskDue("");
-  }, [fTaskTitle, fTaskNotes, fTaskDue, fTaskProject]);
+    // reset back to the selected world's archetype defaults (not bare blanks),
+    // so back-to-back captures on a fire-drill world keep their prefills
+    const arch = archetypeFor(projectsRef.current.find((p) => p.id === fTaskProject));
+    setFTaskTitle(""); setFTaskNotes("");
+    setFTaskDue(arch.dueToday ? todayISO() : "");
+    setFImportant(arch.importantDefault);
+  }, [fTaskTitle, fTaskNotes, fTaskDue, fTaskProject, fImportant]);
 
   const completeTask = useCallback((projectId, taskId) => {
     const world = worldRef.current;
@@ -1432,6 +1549,14 @@ export default function Orrery() {
       : p));
   }, []);
 
+  // re-triage from the detail panel — signature() ignores `important`, so this
+  // re-derives labels/index without triggering an expensive planet rebuild.
+  const setTaskImportant = useCallback((projectId, taskId, important) => {
+    setProjects((ps) => ps.map((p) => p.id === projectId
+      ? { ...p, tasks: p.tasks.map((t) => t.id === taskId ? { ...t, important } : t) }
+      : p));
+  }, []);
+
   const deleteTask = useCallback((projectId, taskId) => {
     setSelected(null);
     setProjects((ps) => ps.map((p) => p.id === projectId
@@ -1447,8 +1572,13 @@ export default function Orrery() {
   }, []);
 
   /* ---------- debug/simulation actions (bulk data ops for fast manual QA) ---------- */
+  // open debug tasks get a deterministic quadrant mix (¼ overdue, ¼ due in
+  // 2 days, rest undated; every 3rd not-important) so stress-test galaxies
+  // exercise all four Eisenhower quadrants instead of reading uniformly Q2.
   const dbgMakeTasks = (count, done) => Array.from({ length: count }, (_, i) => ({
-    id: uid(), title: `Debug task ${i + 1}`, notes: "", due: null,
+    id: uid(), title: `Debug task ${i + 1}`, notes: "",
+    due: done ? null : (i % 4 === 0 ? todayISO(-1) : i % 4 === 1 ? todayISO(2) : null),
+    important: i % 3 !== 0,
     done, createdAt: Date.now(), completedAt: done ? Date.now() : null,
   }));
   const dbgAddOpenTasks = useCallback((projectId, count) => {
@@ -1584,6 +1714,22 @@ export default function Orrery() {
                 Due {fmtDate(selTask.due)}{overdue(selTask) ? " · past due" : ""}
               </div>
             )}
+            {!selTask.done && (
+              <div className={"d-row d-quadrant" + (taskQuadrant(selTask) === "q1" ? " warn" : "")}>
+                {{
+                  q1: "▲ Do first — important & due soon",
+                  q2: "Scheduled — important, not yet urgent",
+                  q3: "△ Contain — due soon, not important",
+                  q4: "Drifting — not important, no near date",
+                }[taskQuadrant(selTask)]}
+                <button
+                  className="ghost-btn sm"
+                  onClick={() => setTaskImportant(selected.projectId, selTask.id, !taskImportant(selTask))}
+                >
+                  {taskImportant(selTask) ? "Demote: not important" : "Mark important"}
+                </button>
+              </div>
+            )}
             {selTask.completedAt && (
               <div className="d-row">Completed {new Date(selTask.completedAt).toLocaleDateString()}</div>
             )}
@@ -1631,18 +1777,26 @@ export default function Orrery() {
         {indexOpen && (
           <div className="index">
             {projects.length === 0 && <div className="idx-empty">No worlds yet</div>}
-            {projects.map((p) => {
-              const done = p.tasks.filter((t) => t.done).length;
-              return (
-                <button key={p.id} className="idx-row" onClick={() => {
-                  setView({ mode: "planet", projectId: p.id });
-                  setSelected(null); setIndexOpen(false);
-                }}>
-                  <span className="idx-name">{p.name}</span>
-                  <span className="idx-meta">{done}/{p.tasks.length}</span>
-                </button>
-              );
-            })}
+            {projects
+              .map((p) => ({ p, pri: projectPriority(p) }))
+              .sort((a, b) => (b.pri.q1 - a.pri.q1) || ((b.pri.q3 > 0 ? 1 : 0) - (a.pri.q3 > 0 ? 1 : 0)))
+              .map(({ p, pri }) => {
+                const done = p.tasks.filter((t) => t.done).length;
+                return (
+                  <button key={p.id} className="idx-row" onClick={() => {
+                    setView({ mode: "planet", projectId: p.id });
+                    setSelected(null); setIndexOpen(false);
+                  }}>
+                    <span className="idx-name">{p.name}</span>
+                    {pri.q1 > 0 && <span className="idx-badge q1">▲{pri.q1}</span>}
+                    {pri.q1 === 0 && pri.q3 > 0 && <span className="idx-badge q3">△{pri.q3}</span>}
+                    <span className="idx-meta">{done}/{p.tasks.length}</span>
+                  </button>
+                );
+              })}
+            {projects.length > 0 && (
+              <div className="idx-legend">▲ important & due soon · △ due soon</div>
+            )}
           </div>
         )}
       </div>
@@ -1743,6 +1897,10 @@ export default function Orrery() {
                 <label className="f-label" htmlFor="pdesc">Description (optional)</label>
                 <textarea id="pdesc" className="f-input" rows={2} value={fProjDesc} onChange={(e) => setFProjDesc(e.target.value)}
                   placeholder="What is this world?" />
+                <label className="f-label" htmlFor="parch">Work type</label>
+                <select id="parch" className="f-input" value={fProjArch} onChange={(e) => setFProjArch(e.target.value)}>
+                  {ARCHETYPES.map((a) => <option key={a.key} value={a.key}>{a.label}</option>)}
+                </select>
                 <div className="m-actions">
                   <button className="primary-btn" disabled={!fProjName.trim()} onClick={addProject}>
                     Birth this world
@@ -1766,6 +1924,10 @@ export default function Orrery() {
                   placeholder="Details worth remembering" />
                 <label className="f-label" htmlFor="tdue">Due date (optional)</label>
                 <input id="tdue" type="date" className="f-input" value={fTaskDue} onChange={(e) => setFTaskDue(e.target.value)} />
+                <label className="f-check">
+                  <input type="checkbox" checked={fImportant} onChange={(e) => setFImportant(e.target.checked)} />
+                  <span>Important — due dates on important tasks surface them as <b>▲ do first</b></span>
+                </label>
                 <div className="m-actions">
                   <button className="primary-btn" disabled={!fTaskTitle.trim() || !fTaskProject} onClick={addTask}>
                     Send into orbit
@@ -1809,6 +1971,9 @@ const css = `
   color: var(--ink-dim); text-shadow: 0 0 8px rgba(120,150,255,0.6);
   white-space: nowrap; will-change: transform, opacity;
 }
+/* Q1 planets — the ▲count prefix carries the signal by shape; the warm tint
+   and brighter weight reinforce it but are never the sole channel. */
+.planet-label.q1 { color: var(--warn); font-size: 13.5px; text-shadow: 0 0 10px rgba(232,197,138,0.55); }
 .task-label {
   position: absolute; left: 0; top: 0; pointer-events: none;
   font-family: 'Cormorant Garamond', serif; font-size: 11px; opacity: 0.85;
@@ -1858,6 +2023,8 @@ const css = `
 .d-rows { margin-top: 10px; }
 .d-row { font-size: 12.5px; color: var(--ink-dim); margin-top: 2px; }
 .d-row.warn { color: var(--warn); }
+.d-quadrant { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+.d-quadrant .ghost-btn.sm { font-size: 11px; padding: 4px 8px; }
 .d-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
 
 .empty {
@@ -1897,9 +2064,16 @@ const css = `
   font-family: inherit;
 }
 .idx-row:hover { background: rgba(150,175,255,0.10); }
-.idx-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.idx-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .idx-meta { color: var(--ink-dim); font-size: 12px; flex-shrink: 0; }
 .idx-empty { color: var(--ink-dim); font-size: 13px; padding: 8px 10px; }
+.idx-badge { font-size: 11.5px; flex-shrink: 0; letter-spacing: 0.02em; }
+.idx-badge.q1 { color: var(--warn); }
+.idx-badge.q3 { color: var(--ink-dim); }
+.idx-legend {
+  font-size: 10.5px; color: var(--ink-dim); opacity: 0.8;
+  padding: 7px 10px 3px; border-top: 1px solid var(--line); margin-top: 4px;
+}
 
 .bottom-right { right: 18px; bottom: 18px; display: flex; gap: 10px; align-items: center; }
 .save-note { font-size: 11.5px; color: var(--ink-dim); }
@@ -1949,6 +2123,12 @@ const css = `
 .m-tab.on { color: var(--ink); border-color: rgba(160,185,255,0.5); background: rgba(130,160,255,0.10); }
 .m-tab:disabled { opacity: 0.35; cursor: default; }
 .f-label { display: block; font-size: 11.5px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-dim); margin: 12px 0 5px; }
+.f-check {
+  display: flex; gap: 9px; align-items: baseline; margin: 12px 0 2px;
+  font-size: 12.5px; color: var(--ink-dim); cursor: pointer; line-height: 1.45;
+}
+.f-check input { flex-shrink: 0; accent-color: var(--accent); cursor: pointer; }
+.f-check b { color: var(--warn); font-weight: 500; }
 .f-input {
   width: 100%; box-sizing: border-box; background: rgba(6,10,26,0.8);
   border: 1px solid var(--line); border-radius: 10px; color: var(--ink);
