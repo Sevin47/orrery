@@ -159,6 +159,12 @@ function taskUrgent(t) {
   const horizon = new Date(Date.now() + URGENT_WINDOW_DAYS * 24 * 60 * 60 * 1000);
   return due <= horizon;
 }
+// Overdue is a SUB-tier of urgent (every overdue task is already urgent —
+// due < now implies due <= now+window), used only to escalate the visual
+// treatment within q1/q3, not to create a fifth quadrant.
+function taskOverdue(t) {
+  return !!(t.due && !t.done && new Date(t.due + "T23:59:59") < new Date());
+}
 function taskQuadrant(t) {
   return taskImportant(t)
     ? (taskUrgent(t) ? "q1" : "q2")
@@ -173,6 +179,42 @@ function projectPriority(p) {
     else if (q === "q3") q3++;
   }
   return { q1, q3 };
+}
+// Staleness — a "worth revisiting" signal, distinct from urgency. Adding a
+// task counts as activity (not just finishing one), so a maintenance world
+// someone is actively populating doesn't read as neglected before its first
+// completion. createdAt/completedAt were always stamped but never shown.
+const STALE_DAYS = 21;
+function projectStaleDays(p) {
+  let last = p.createdAt || Date.now();
+  for (const t of p.tasks) {
+    if (t.createdAt) last = Math.max(last, t.createdAt);
+    if (t.completedAt) last = Math.max(last, t.completedAt);
+  }
+  return Math.floor((Date.now() - last) / 86400000);
+}
+function isProjectStale(p) {
+  return projectStaleDays(p) >= STALE_DAYS;
+}
+// Unified task search — the single surface for "find a task without knowing
+// which world it's on": real DOM rows, so it works for keyboard/screen-reader
+// users the same as mouse, unlike 3D picking. Matches task title or parent
+// world name (typing a world's name surfaces all its tasks too). Capped, not
+// silently truncated — the caller shows "N more matches" when total > limit.
+const TASK_SEARCH_LIMIT = 50;
+function searchTasks(projects, query, limit = TASK_SEARCH_LIMIT) {
+  const q = query.trim().toLowerCase();
+  if (!q) return { results: [], total: 0 };
+  const hits = [];
+  for (const p of projects) {
+    const nameMatch = p.name.toLowerCase().includes(q);
+    for (const t of p.tasks) {
+      if (nameMatch || t.title.toLowerCase().includes(q)) hits.push({ p, t });
+    }
+  }
+  const rank = (t) => t.done ? 4 : { q1: 0, q3: 1, q2: 2, q4: 3 }[taskQuadrant(t)];
+  hits.sort((a, b) => rank(a.t) - rank(b.t));
+  return { results: hits.slice(0, limit), total: hits.length };
 }
 // Dust agitation — open-task stardust moves by triage state: Q1 orbits fast
 // and tight (agitated, insistent), Q3 quick, Q2 calm baseline, Q4 slow and
@@ -189,13 +231,35 @@ const DUST_QUAD_GAP = { q1: 0.8, q2: 1.0, q3: 1.0, q4: 1.3 };
 // orbit distance, and the ▲/△ glyph on the task label carry the same rank.
 const DUST_QUAD_SIZE = { q1: 0.32, q2: 0.24, q3: 0.28, q4: 0.20 };
 const DUST_QUAD_GLYPH = { q1: "▲ ", q2: "", q3: "△ ", q4: "" };
-function dustQuadColor(quad, pal) {
+// Overdue escalation — a sub-tier WITHIN q1/q3 (q2/q4 are never urgent, so
+// never overdue). "Due in 3 days" and "overdue by a week" otherwise render
+// identically; this is the extra notch of color/size/speed/glyph that
+// answers "which do I click first" once several q1 tasks are competing.
+// Shape escalates too (▲!/△! vs ▲ /△ ), not just color, per the same
+// color-blind guardrail as the base quadrant colors.
+const OVERDUE_SPEED_BOOST = 1.3;
+const DUST_QUAD_SIZE_OVERDUE = { q1: 0.38, q3: 0.32 };
+const DUST_QUAD_GLYPH_OVERDUE = { q1: "▲! ", q3: "△! " };
+function dustQuadColor(quad, pal, overdue) {
+  if (overdue) {
+    if (quad === "q1") return new THREE.Color(0xff5a3c); // crimson — do first, already late
+    if (quad === "q3") return new THREE.Color(0xd98f3c); // burnt orange — overdue, not important
+  }
   switch (quad) {
     case "q1": return new THREE.Color(0xffab66); // hot amber — do first
     case "q3": return new THREE.Color(0xe8dc8a); // pale caution yellow — due soon, not important
     case "q4": return new THREE.Color(0x5a6478); // dim slate — drifting
     default: return pal.accent.clone();          // q2 keeps the project's identity accent
   }
+}
+function dustQuadSize(quad, overdue) {
+  return (overdue && DUST_QUAD_SIZE_OVERDUE[quad]) || DUST_QUAD_SIZE[quad];
+}
+function dustQuadGlyph(quad, overdue) {
+  return (overdue && DUST_QUAD_GLYPH_OVERDUE[quad]) || DUST_QUAD_GLYPH[quad];
+}
+function dustQuadSpeed(quad, overdue) {
+  return DUST_QUAD_SPEED[quad] * (overdue && (quad === "q1" || quad === "q3") ? OVERDUE_SPEED_BOOST : 1);
 }
 // Project archetypes — the user's five real work categories. This slice they
 // only drive intake pre-fills (default importance, and exec fire drills
@@ -549,9 +613,10 @@ function attachPlanetDetail(rec, project) {
     pg.setAttribute("position", new THREE.BufferAttribute(arr, 3));
     pg.setAttribute("color", new THREE.Float32BufferAttribute(colArr, 3));
     const quad = taskQuadrant(task);
+    const overdue = taskOverdue(task);
     const pm = new THREE.PointsMaterial({
-      map: dustMap, vertexColors: true, size: DUST_QUAD_SIZE[quad],
-      color: dustQuadColor(quad, pal), transparent: true, opacity: 0.85,
+      map: dustMap, vertexColors: true, size: dustQuadSize(quad, overdue),
+      color: dustQuadColor(quad, pal, overdue), transparent: true, opacity: 0.85,
       blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true,
     });
     const points = new THREE.Points(pg, pm);
@@ -573,7 +638,7 @@ function attachPlanetDetail(rec, project) {
       cluster, points, clickSphere, task,
       orbitR: R + (dustGap + (i % 5) * dustStagger) * DUST_QUAD_GAP[quad],
       speed: 0.12 + trng() * 0.12,
-      quadSpeed: DUST_QUAD_SPEED[quad],
+      quadSpeed: dustQuadSpeed(quad, overdue),
       phase,
       ang: phase, // accumulated orbit angle — advanced per-frame so speed can change live
       incline: (trng() - 0.5) * 0.9,
@@ -604,6 +669,10 @@ function refreshPlanetPriorities(world, projects) {
     const rec = world.planets.get(p.id);
     if (!rec) continue;
     rec.q1Count = projectPriority(p).q1;
+    // motion-only cue (not brightness — dimming risks recreating the exact
+    // contrast problem already fixed once): a stale world visibly slows its
+    // own revolution and spin, reads as neglected without touching color.
+    rec.staleFactor = isProjectStale(p) ? 0.4 : 1;
     if (rec.label) {
       const wanted = rec.q1Count > 0 ? `▲${rec.q1Count} · ${p.name}` : p.name;
       if (rec.label.textContent !== wanted) rec.label.textContent = wanted;
@@ -620,9 +689,10 @@ function refreshPlanetPriorities(world, projects) {
         if (fresh) {
           d.task = fresh;
           const quad = taskQuadrant(fresh);
-          d.quadSpeed = DUST_QUAD_SPEED[quad];
-          d.points.material.color.copy(dustQuadColor(quad, rec.pal));
-          d.points.material.size = DUST_QUAD_SIZE[quad];
+          const overdue = taskOverdue(fresh);
+          d.quadSpeed = dustQuadSpeed(quad, overdue);
+          d.points.material.color.copy(dustQuadColor(quad, rec.pal, overdue));
+          d.points.material.size = dustQuadSize(quad, overdue);
         }
       }
       if (rec.taskLabels) {
@@ -631,10 +701,12 @@ function refreshPlanetPriorities(world, projects) {
           const fresh = p.tasks.find((t) => t.id === tl.taskId);
           if (!fresh) continue;
           const quad = taskQuadrant(fresh);
-          const wanted = DUST_QUAD_GLYPH[quad] + fresh.title;
+          const overdue = taskOverdue(fresh);
+          const wanted = dustQuadGlyph(quad, overdue) + fresh.title;
           if (tl.el.textContent !== wanted) tl.el.textContent = wanted;
           tl.el.classList.toggle("q1", quad === "q1");
           tl.el.classList.toggle("q3", quad === "q3");
+          tl.el.classList.toggle("overdue", overdue);
         }
       }
     }
@@ -676,6 +748,7 @@ export default function Orrery() {
   const [intakeOpen, setIntakeOpen] = useState(false);
   const [intakeMode, setIntakeMode] = useState("project");
   const [indexOpen, setIndexOpen] = useState(false);
+  const [indexQuery, setIndexQuery] = useState("");
   const [debugOpen, setDebugOpen] = useState(false);
   const [dbgCount, setDbgCount] = useState(10);
   const [dbgConfirmClear, setDbgConfirmClear] = useState(false);
@@ -1028,7 +1101,10 @@ export default function Orrery() {
 
       const v = viewRef.current;
       for (const [pid, rec] of world.planets) {
-        rec.orbitAngle += dt * rec.orbitSpeed * motion;
+        // stale worlds visibly slow their own revolution and spin — a
+        // motion-only "neglected" cue, not a brightness one (see staleFactor)
+        const staleFactor = rec.staleFactor || 1;
+        rec.orbitAngle += dt * rec.orbitSpeed * motion * staleFactor;
         rec.group.position.set(
           Math.cos(rec.orbitAngle) * rec.orbitRadius,
           rec.orbitY,
@@ -1040,7 +1116,7 @@ export default function Orrery() {
         // scatter/reform tween is one of the most vestibular-heavy effects
         if (reducedMotion.current) rec.explode = target;
         else rec.explode += (target - rec.explode) * Math.min(1, dt * 2.4);
-        rec.spinAngle += dt * rec.spinSpeed * motion * (1 - 0.75 * rec.explode);
+        rec.spinAngle += dt * rec.spinSpeed * motion * staleFactor * (1 - 0.75 * rec.explode);
         rec.spin.rotation.y = rec.spinAngle;
         const amt = rec.explode * (rec.R * 0.55 + 0.45);
         rec.chunks.forEach((ch) => {
@@ -1248,8 +1324,9 @@ export default function Orrery() {
     rec.dust.forEach((d) => {
       const el = document.createElement("div");
       const quad = taskQuadrant(d.task);
-      el.className = "task-label" + (quad === "q1" ? " q1" : quad === "q3" ? " q3" : "");
-      el.textContent = DUST_QUAD_GLYPH[quad] + d.task.title;
+      const overdue = taskOverdue(d.task);
+      el.className = "task-label" + (quad === "q1" ? " q1" : quad === "q3" ? " q3" : "") + (overdue ? " overdue" : "");
+      el.textContent = dustQuadGlyph(quad, overdue) + d.task.title;
       layer.appendChild(el);
       rec.taskLabels.push({ el, kind: "dust", cluster: d.cluster, taskId: d.task.id });
     });
@@ -1714,7 +1791,7 @@ export default function Orrery() {
   const selTask = selected
     ? projects.find((p) => p.id === selected.projectId)?.tasks.find((t) => t.id === selected.taskId)
     : null;
-  const overdue = (t) => t.due && !t.done && new Date(t.due + "T23:59:59") < new Date();
+  const overdue = taskOverdue;
 
   /* ---------- debug panel data (re-read live each debugTick while open) ---------- */
   const dbgWorld = worldRef.current;
@@ -1811,12 +1888,17 @@ export default function Orrery() {
             )}
             {!selTask.done && (
               <div className={"d-row d-quadrant" + (taskQuadrant(selTask) === "q1" ? " warn" : "")}>
-                {{
-                  q1: "▲ Do first — important & due soon",
-                  q2: "Scheduled — important, not yet urgent",
-                  q3: "△ Contain — due soon, not important",
-                  q4: "Drifting — not important, no near date",
-                }[taskQuadrant(selTask)]}
+                {overdue(selTask)
+                  ? {
+                      q1: "▲ Do first — important & OVERDUE",
+                      q3: "△ Contain — OVERDUE, not important",
+                    }[taskQuadrant(selTask)]
+                  : {
+                      q1: "▲ Do first — important & due soon",
+                      q2: "Scheduled — important, not yet urgent",
+                      q3: "△ Contain — due soon, not important",
+                      q4: "Drifting — not important, no near date",
+                    }[taskQuadrant(selTask)]}
                 <button
                   className="ghost-btn sm"
                   onClick={() => setTaskImportant(selected.projectId, selTask.id, !taskImportant(selTask))}
@@ -1866,31 +1948,78 @@ export default function Orrery() {
 
       {/* index */}
       <div className="hud index-wrap">
-        <button className="ghost-btn sm" onClick={() => setIndexOpen((o) => !o)}>
+        <button className="ghost-btn sm" onClick={() => setIndexOpen((o) => { if (o) setIndexQuery(""); return !o; })}>
           {indexOpen ? "Close index" : `Index · ${projects.length}`}
         </button>
         {indexOpen && (
           <div className="index">
-            {projects.length === 0 && <div className="idx-empty">No worlds yet</div>}
-            {projects
-              .map((p) => ({ p, pri: projectPriority(p) }))
-              .sort((a, b) => (b.pri.q1 - a.pri.q1) || ((b.pri.q3 > 0 ? 1 : 0) - (a.pri.q3 > 0 ? 1 : 0)))
-              .map(({ p, pri }) => {
-                const done = p.tasks.filter((t) => t.done).length;
-                return (
-                  <button key={p.id} className="idx-row" onClick={() => {
-                    setView({ mode: "planet", projectId: p.id });
-                    setSelected(null); setIndexOpen(false);
-                  }}>
-                    <span className="idx-name">{p.name}</span>
-                    {pri.q1 > 0 && <span className="idx-badge q1">▲{pri.q1}</span>}
-                    {pri.q1 === 0 && pri.q3 > 0 && <span className="idx-badge q3">△{pri.q3}</span>}
-                    <span className="idx-meta">{done}/{p.tasks.length}</span>
-                  </button>
-                );
-              })}
-            {projects.length > 0 && (
-              <div className="idx-legend">▲ important & due soon · △ due soon · press 1 to fly to ▲</div>
+            <input
+              className="idx-search"
+              autoFocus
+              value={indexQuery}
+              onChange={(e) => setIndexQuery(e.target.value)}
+              placeholder="Search tasks or worlds…"
+            />
+            {indexQuery.trim() ? (() => {
+              const { results, total } = searchTasks(projects, indexQuery);
+              if (results.length === 0) {
+                return <div className="idx-empty">No tasks match "{indexQuery.trim()}"</div>;
+              }
+              return (
+                <>
+                  {results.map(({ p, t }) => {
+                    const quad = taskQuadrant(t);
+                    const isOverdue = taskOverdue(t);
+                    const sev = t.done ? "" : quad === "q1" ? " q1" : quad === "q3" ? " q3" : "";
+                    return (
+                      <button
+                        key={t.id}
+                        className="idx-task-row"
+                        onClick={() => {
+                          setView({ mode: "planet", projectId: p.id });
+                          setSelected({ projectId: p.id, taskId: t.id });
+                          setIndexOpen(false);
+                          setIndexQuery("");
+                        }}
+                      >
+                        <span className={"idx-task-title" + sev + (isOverdue ? " overdue" : "") + (t.done ? " done" : "")}>
+                          {!t.done ? dustQuadGlyph(quad, isOverdue) : ""}{t.title}
+                        </span>
+                        <span className="idx-task-sub">{p.name}</span>
+                      </button>
+                    );
+                  })}
+                  {total > results.length && (
+                    <div className="idx-legend">{total - results.length} more matches not shown</div>
+                  )}
+                </>
+              );
+            })() : (
+              <>
+                {projects.length === 0 && <div className="idx-empty">No worlds yet</div>}
+                {projects
+                  .map((p) => ({ p, pri: projectPriority(p) }))
+                  .sort((a, b) => (b.pri.q1 - a.pri.q1) || ((b.pri.q3 > 0 ? 1 : 0) - (a.pri.q3 > 0 ? 1 : 0)))
+                  .map(({ p, pri }) => {
+                    const done = p.tasks.filter((t) => t.done).length;
+                    const staleDays = projectStaleDays(p);
+                    return (
+                      <button key={p.id} className="idx-row" onClick={() => {
+                        setView({ mode: "planet", projectId: p.id });
+                        setSelected(null); setIndexOpen(false);
+                      }}>
+                        <span className="idx-name">{p.name}</span>
+                        {pri.q1 > 0 && <span className="idx-badge q1">▲{pri.q1}</span>}
+                        {pri.q1 === 0 && pri.q3 > 0 && <span className="idx-badge q3">△{pri.q3}</span>}
+                        {staleDays >= STALE_DAYS && <span className="idx-badge idle">· {staleDays}d idle</span>}
+                        <span className="idx-meta">{done}/{p.tasks.length}</span>
+                      </button>
+                    );
+                  })}
+                {projects.length > 0 && (
+                  <div className="idx-legend">▲ important & due soon · △ due soon · press 1 to fly to ▲</div>
+                )}
+              </>
             )}
           </div>
         )}
@@ -2079,6 +2208,10 @@ const css = `
    same rank by shape for color-blind users */
 .task-label.q1 { color: #ffab66; opacity: 1; font-size: 11.5px; text-shadow: 0 0 8px rgba(255,171,102,0.5); }
 .task-label.q3 { color: #e8dc8a; text-shadow: 0 0 6px rgba(232,220,138,0.4); }
+/* overdue escalates the same slot further — crimson/burnt-orange, a touch
+   larger — an extra notch on top of the base q1/q3 tint above */
+.task-label.q1.overdue { color: #ff5a3c; font-size: 12px; text-shadow: 0 0 9px rgba(255,90,60,0.6); }
+.task-label.q3.overdue { color: #d98f3c; text-shadow: 0 0 7px rgba(217,143,60,0.45); }
 .hud { position: absolute; z-index: 5; }
 .tip {
   position: absolute; z-index: 6; pointer-events: none;
@@ -2166,9 +2299,29 @@ const css = `
 .idx-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .idx-meta { color: var(--ink-dim); font-size: 12px; flex-shrink: 0; }
 .idx-empty { color: var(--ink-dim); font-size: 13px; padding: 8px 10px; }
+.idx-search {
+  width: 100%; box-sizing: border-box; background: rgba(6,10,26,0.8);
+  border: 1px solid var(--line); border-radius: 9px; color: var(--ink);
+  padding: 8px 10px; font-size: 13px; font-family: inherit; outline: none;
+  margin-bottom: 6px;
+}
+.idx-task-row {
+  display: flex; flex-direction: column; gap: 1px; width: 100%;
+  background: none; border: none; color: var(--ink); cursor: pointer;
+  padding: 8px 10px; border-radius: 9px; text-align: left; font-family: inherit;
+}
+.idx-task-row:hover { background: rgba(150,175,255,0.10); }
+.idx-task-title { font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.idx-task-title.done { color: var(--ink-dim); text-decoration: line-through; opacity: 0.7; }
+.idx-task-title.q1 { color: var(--warn); }
+.idx-task-title.q3 { color: var(--ink-dim); }
+.idx-task-title.q1.overdue { color: #ff5a3c; }
+.idx-task-title.q3.overdue { color: #d98f3c; }
+.idx-task-sub { font-size: 11px; color: var(--ink-dim); opacity: 0.75; }
 .idx-badge { font-size: 11.5px; flex-shrink: 0; letter-spacing: 0.02em; }
 .idx-badge.q1 { color: var(--warn); }
 .idx-badge.q3 { color: var(--ink-dim); }
+.idx-badge.idle { color: var(--ink-dim); opacity: 0.65; font-style: italic; }
 .idx-legend {
   font-size: 10.5px; color: var(--ink-dim); opacity: 0.8;
   padding: 7px 10px 3px; border-top: 1px solid var(--line); margin-top: 4px;
