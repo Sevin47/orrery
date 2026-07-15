@@ -51,8 +51,14 @@ const PLANET_VISUAL_SPREAD = 2.6;
 // The central star every project-planet orbits. One system for now; a later
 // pass may split projects by year into their own solar systems under a wider
 // galaxy view, at which point this becomes per-system rather than singular.
-const STAR_RADIUS = 9;
-const STAR_CLEARANCE = STAR_RADIUS * PLANET_VISUAL_SPREAD + 10; // keep planet 0 clear of the star's own glow
+// Kept comfortably above radiusFor's max (16) so the star always reads as the
+// biggest body in the scene — a planet that outgrows its own sun breaks the
+// scale hierarchy that makes this look like a solar system at all.
+const STAR_RADIUS = 24;
+// Scales with STAR_RADIUS, so a bigger star automatically pushes every
+// planet's orbit further out too — "ample space from the sun" falls out of
+// the same knob rather than needing a separate constant.
+const STAR_CLEARANCE = STAR_RADIUS * PLANET_VISUAL_SPREAD + 10;
 
 // Inner planets revolve faster than outer ones (loosely Keplerian — period
 // grows with radius) but everything is slowed to a calm, ambient drift rather
