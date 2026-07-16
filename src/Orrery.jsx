@@ -852,11 +852,28 @@ export default function Orrery() {
   // the app without cloud sync configured.
   useEffect(() => {
     if (!supabase) return;
+    // If we just landed from an OAuth redirect, supabase-js's own hash
+    // processing can occasionally still be settling when this first
+    // getSession() resolves, showing signed-out until something (a manual
+    // refresh) re-triggers it. A short delayed re-check closes that gap.
+    const hadAuthRedirect = window.location.hash.includes("access_token");
+    const clearHash = () => {
+      if (window.location.hash) {
+        window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      }
+    };
     supabase.auth.getSession().then(({ data }) => setUser(data.session?.user ?? null));
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
       setUser(session?.user ?? null);
+      clearHash(); // whatever supabase-js did or didn't clean up, don't leave token debris in the URL
     });
-    return () => sub.subscription.unsubscribe();
+    let retry;
+    if (hadAuthRedirect) {
+      retry = setTimeout(() => {
+        supabase.auth.getSession().then(({ data }) => setUser(data.session?.user ?? null));
+      }, 400);
+    }
+    return () => { sub.subscription.unsubscribe(); clearTimeout(retry); };
   }, []);
 
   // The backend is authoritative once signed in — a user can never be "out
@@ -2140,7 +2157,15 @@ export default function Orrery() {
           ) : (
             <button
               className="ghost-btn sm"
-              onClick={() => supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.href } })}
+              onClick={() => supabase.auth.signInWithOAuth({
+                provider: "google",
+                // Deliberately NOT window.location.href: if a retry happens while
+                // the previous attempt's #access_token=... fragment is still in
+                // the URL, Supabase appends a new fragment onto the old one
+                // instead of replacing it, stacking into an ever-growing mess.
+                // Always redirect to the clean base URL instead.
+                options: { redirectTo: window.location.origin + window.location.pathname },
+              })}
             >
               ☁ Sign in to sync
             </button>
