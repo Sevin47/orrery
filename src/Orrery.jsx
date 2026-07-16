@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import * as THREE from "three";
 import * as Tone from "tone";
 import { mergeVertices } from "three/examples/jsm/utils/BufferGeometryUtils.js";
+import { supabase, loadCloudProjects, saveCloudProjects } from "./supabaseClient.js";
 
 // Injected by .github/workflows/deploy.yml at build time (VITE_-prefixed env
 // vars are auto-exposed by Vite); falls back to "dev" for local `npm run dev`.
@@ -757,6 +758,7 @@ export default function Orrery() {
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [confirmDeleteTask, setConfirmDeleteTask] = useState(null);
   const [saveNote, setSaveNote] = useState("");
+  const [user, setUser] = useState(null); // Supabase auth user, or null when signed out / not configured
   const viewRef = useRef(view);
   viewRef.current = view;
   const intakeOpenRef = useRef(intakeOpen);
@@ -829,14 +831,62 @@ export default function Orrery() {
     const t = setTimeout(() => {
       try {
         localStorage.setItem("orrery_galaxy_v1", JSON.stringify({ projects }));
-        setSaveNote("saved");
-        setTimeout(() => setSaveNote(""), 1500);
+        if (user) {
+          saveCloudProjects(user.id, projects)
+            .then(() => { setSaveNote("synced"); setTimeout(() => setSaveNote(""), 1500); })
+            .catch(() => { setSaveNote("sync failed"); setTimeout(() => setSaveNote(""), 2500); });
+        } else {
+          setSaveNote("saved");
+          setTimeout(() => setSaveNote(""), 1500);
+        }
       } catch (e) {
         setSaveNote("save failed");
       }
     }, 600);
     return () => clearTimeout(t);
-  }, [projects, loaded]);
+  }, [projects, loaded, user]);
+
+  /* ---------- cloud sync (Supabase, optional) ---------- */
+  // Hydrates auth state; entirely inert if VITE_SUPABASE_* env vars are
+  // absent (supabase client is null), so this is a no-op for anyone running
+  // the app without cloud sync configured.
+  useEffect(() => {
+    if (!supabase) return;
+    supabase.auth.getSession().then(({ data }) => setUser(data.session?.user ?? null));
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  // The backend is authoritative once signed in — a user can never be "out
+  // of sync" because there's only one copy that matters. Runs once per
+  // sign-in (keyed on user+loaded, not on projects — must NOT re-fire on
+  // every subsequent edit). No cloud row yet (brand-new account) → today's
+  // projects become the seed, the one case with nothing to defer to yet.
+  // Otherwise the cloud copy replaces whatever's showing, unconditionally —
+  // no comparison against local, no prompt.
+  useEffect(() => {
+    if (!user || !loaded || !supabase) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const cloudProjects = await loadCloudProjects(user.id);
+        if (cancelled) return;
+        if (cloudProjects === null) {
+          await saveCloudProjects(user.id, projectsRef.current);
+        } else {
+          setProjects(cloudProjects);
+          // mirror immediately so a previous account's cache can't linger
+          try { localStorage.setItem("orrery_galaxy_v1", JSON.stringify({ projects: cloudProjects })); } catch (e) { /* best-effort cache */ }
+        }
+      } catch (e) {
+        setSaveNote("sync failed");
+        setTimeout(() => setSaveNote(""), 2500);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [user, loaded]);
 
   /* ---------- audio ---------- */
   const chime = useCallback((big = false) => {
@@ -2082,6 +2132,20 @@ export default function Orrery() {
       {/* bottom controls */}
       <div className="hud bottom-right">
         {saveNote && <span className="save-note">{saveNote}</span>}
+        {supabase && (
+          user ? (
+            <button className="ghost-btn sm" onClick={() => supabase.auth.signOut()} title={user.email}>
+              ☁ {user.email || "synced"}
+            </button>
+          ) : (
+            <button
+              className="ghost-btn sm"
+              onClick={() => supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.href } })}
+            >
+              ☁ Sign in to sync
+            </button>
+          )
+        )}
         <button className="ghost-btn sm" onClick={() => { setDebugOpen((o) => !o); setDbgConfirmClear(false); }} aria-label="Toggle debug panel">
           ⚙ debug
         </button>
@@ -2329,6 +2393,7 @@ const css = `
 
 .bottom-right { right: 18px; bottom: 18px; display: flex; gap: 10px; align-items: center; }
 .save-note { font-size: 11.5px; color: var(--ink-dim); }
+.bottom-right .ghost-btn.sm { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .primary-btn {
   background: linear-gradient(180deg, rgba(130,160,255,0.28), rgba(90,120,220,0.20));
