@@ -763,6 +763,11 @@ export default function Orrery() {
   viewRef.current = view;
   const intakeOpenRef = useRef(intakeOpen);
   intakeOpenRef.current = intakeOpen;
+  // How many of OUR history.pushState entries are currently ahead of the
+  // real back-stack (see the Back-button effects below) — lets exitToGalaxy
+  // safely call history.back() only when there's a matching entry to
+  // consume, so it can never eject the user from the app entirely.
+  const orreryHistoryDepth = useRef(0);
   const soundRef = useRef({ ready: false, synth: null, chime: null, timer: null });
   const dragRef = useRef({ down: false, moved: false, startX: 0, startY: 0, startTheta: 0, startAlpha: 0 });
   const reducedMotion = useRef(
@@ -788,6 +793,29 @@ export default function Orrery() {
     const id = setInterval(() => setDebugTick((t) => t + 1), 300);
     return () => clearInterval(id);
   }, [debugOpen]);
+
+  /* ---------- return focus to the trigger when an overlay closes ---------- */
+  // Covers all four overlays with one restore effect instead of threading it
+  // through every close handler separately. The *save* side can't live in
+  // that same effect, though: the Index search box and both intake forms all
+  // use autoFocus, which the browser applies during the same commit that
+  // opens the overlay — earlier than any useEffect can observe, so a
+  // post-render effect would just capture the overlay's own input instead of
+  // whatever was focused before it opened. rememberFocus() below is called
+  // synchronously inside each trigger's onClick, before the state update that
+  // mounts the overlay, so it always wins that race.
+  const overlayTriggerRef = useRef(null);
+  const rememberFocus = useCallback(() => {
+    overlayTriggerRef.current = document.activeElement;
+  }, []);
+  const anyOverlayOpen = indexOpen || debugOpen || intakeOpen || !!selected;
+  const overlayWasOpenRef = useRef(false);
+  useEffect(() => {
+    if (!anyOverlayOpen && overlayWasOpenRef.current) {
+      overlayTriggerRef.current?.focus?.();
+    }
+    overlayWasOpenRef.current = anyOverlayOpen;
+  }, [anyOverlayOpen]);
 
   // form state
   const [fProjName, setFProjName] = useState("");
@@ -1277,13 +1305,17 @@ export default function Orrery() {
 
       // camera glide — instant follow while actively dragging (either mode),
       // eased lerp otherwise so clicks/zoom/focus changes glide into place.
+      // Under reduced motion this becomes a fast snap rather than a leisurely
+      // ease — every camera transition (focus changes, onboarding's fly-to
+      // a new world, etc.) inherits this, not just the ones written with it
+      // specifically in mind.
       if ((v.mode === "planet" && world.orbit?.dragging) || (v.mode === "galaxy" && world.galaxyOrbit?.dragging)) {
         world.camPos.set(world.camTarget.x, world.camTarget.y, world.camTarget.z);
       } else {
-        world.camPos.lerp(world.camTarget, Math.min(1, dt * 2.2));
+        world.camPos.lerp(world.camTarget, Math.min(1, dt * (reducedMotion.current ? 8 : 2.2)));
       }
       camera.position.copy(world.camPos);
-      world.look.lerp(world.lookTarget, Math.min(1, dt * 2.6));
+      world.look.lerp(world.lookTarget, Math.min(1, dt * (reducedMotion.current ? 9.5 : 2.6)));
       camera.lookAt(world.look);
 
       renderer.render(scene, camera);
@@ -1563,8 +1595,48 @@ export default function Orrery() {
       setSelected(null);
       setHoverTip(null);
     } else {
+      rememberFocus();
       setSelected({ projectId: viewRef.current.projectId, taskId: hit.taskId });
     }
+  }, []);
+
+  // Exits planet focus back to the galaxy — the one place shared by the
+  // header button and Escape. Routes through history.back() when we know
+  // there's a matching pushState entry to consume (see the effects below),
+  // so the browser Back button and these in-app exits stay in sync instead
+  // of drifting apart.
+  const exitToGalaxy = useCallback(() => {
+    if (orreryHistoryDepth.current > 0) {
+      orreryHistoryDepth.current -= 1;
+      window.history.back(); // the popstate effect below performs the actual state change
+    } else {
+      setView({ mode: "galaxy", projectId: null });
+      setSelected(null);
+      setHoverTip(null);
+    }
+  }, []);
+
+  /* ---------- browser Back closes planet focus (not the whole app) ---------- */
+  const prevViewModeRef = useRef(view.mode);
+  useEffect(() => {
+    // only the galaxy->planet transition pushes — cycling between planets
+    // while already focused is a lateral move, not a new "depth"
+    if (prevViewModeRef.current === "galaxy" && view.mode === "planet") {
+      window.history.pushState({ orrery: true }, "");
+      orreryHistoryDepth.current += 1;
+    }
+    prevViewModeRef.current = view.mode;
+  }, [view.mode]);
+
+  useEffect(() => {
+    const onPopState = () => {
+      if (orreryHistoryDepth.current > 0) orreryHistoryDepth.current -= 1;
+      setView({ mode: "galaxy", projectId: null });
+      setSelected(null);
+      setHoverTip(null);
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
   /* ---------- arrow-key planet cycling / escape-to-galaxy ---------- */
@@ -1577,9 +1649,7 @@ export default function Orrery() {
       if (e.key === "Escape") {
         if (viewRef.current.mode === "planet") {
           e.preventDefault();
-          setView({ mode: "galaxy", projectId: null });
-          setSelected(null);
-          setHoverTip(null);
+          exitToGalaxy();
         }
         return;
       }
@@ -1600,6 +1670,41 @@ export default function Orrery() {
         setView({ mode: "planet", projectId: next.id });
         setSelected(null);
         setHoverTip(null);
+        return;
+      }
+
+      // keyboard zoom — same clamps the wheel/pinch handler already uses
+      // (PLANET_ZOOM_MIN/MAX, GALAXY_ZOOM_MIN/MAX), just a fixed step per
+      // press instead of a continuous delta. Keyboard-only users otherwise
+      // have no way to zoom at all.
+      if (e.key === "=" || e.key === "+" || e.key === "-" || e.key === "_") {
+        const world = worldRef.current;
+        if (!world) return;
+        e.preventDefault();
+        const zoomIn = e.key === "=" || e.key === "+";
+        const factor = zoomIn ? 1 / 1.15 : 1.15;
+        if (viewRef.current.mode === "planet") {
+          world.zoom.planet = clamp(world.zoom.planet * factor, PLANET_ZOOM_MIN, PLANET_ZOOM_MAX);
+        } else {
+          world.zoom.galaxy = clamp(world.zoom.galaxy * factor, GALAXY_ZOOM_MIN, GALAXY_ZOOM_MAX);
+        }
+        return;
+      }
+
+      // keyboard orbit — WASD rather than arrow keys (already project-cycling)
+      // or "1" (triage hotkey). Drives whichever orbit is live for the
+      // current mode — planet drag-orbit or galaxy free-orbit — with the
+      // same alpha clamp drag-orbit already uses.
+      if (e.key === "w" || e.key === "s" || e.key === "a" || e.key === "d") {
+        const world = worldRef.current;
+        const orbit = viewRef.current.mode === "planet" ? world?.orbit : world?.galaxyOrbit;
+        if (!orbit) return;
+        e.preventDefault();
+        const step = 0.12;
+        if (e.key === "w") orbit.alpha = clamp(orbit.alpha + step, -ORBIT_ALPHA_LIMIT, ORBIT_ALPHA_LIMIT);
+        if (e.key === "s") orbit.alpha = clamp(orbit.alpha - step, -ORBIT_ALPHA_LIMIT, ORBIT_ALPHA_LIMIT);
+        if (e.key === "a") orbit.theta += step;
+        if (e.key === "d") orbit.theta -= step;
         return;
       }
 
@@ -1731,6 +1836,10 @@ export default function Orrery() {
     setFProjName(""); setFProjDesc(""); setFProjArch("general");
     setIntakeMode("task");
     setFTaskProject(p.id);
+    // fly the camera to the new world instead of leaving it back on the wide
+    // galaxy shot — the intake modal stays open, re-scoped to this project's
+    // task form, so you watch it while adding its first task
+    setView({ mode: "planet", projectId: p.id });
     // apply this archetype's task prefills directly — the world-change effect
     // can't see the new project in projectsRef yet (see its comment)
     const arch = archetypeFor(p);
@@ -1889,7 +1998,7 @@ export default function Orrery() {
       {/* header */}
       <header className="hud top-left">
         {view.mode === "planet" ? (
-          <button className="ghost-btn" onClick={() => { setView({ mode: "galaxy", projectId: null }); setSelected(null); }}>
+          <button className="ghost-btn" onClick={exitToGalaxy}>
             ← Galaxy
           </button>
         ) : (
@@ -1921,7 +2030,7 @@ export default function Orrery() {
           </div>
           <div className="ph-actions">
             <button className="ghost-btn sm" onClick={() => {
-              setIntakeMode("task"); setFTaskProject(focusProject.id); setIntakeOpen(true);
+              rememberFocus(); setIntakeMode("task"); setFTaskProject(focusProject.id); setIntakeOpen(true);
             }}>+ Add task</button>
             {confirmDelete === focusProject.id ? (
               <span className="confirm">
@@ -2007,7 +2116,7 @@ export default function Orrery() {
         <div className="hud empty">
           <div className="empty-title">Your galaxy is empty.</div>
           <div className="empty-sub">Every project becomes a world. Every finished task becomes part of it.</div>
-          <button className="primary-btn" onClick={() => { setIntakeMode("project"); setIntakeOpen(true); }}>
+          <button className="primary-btn" onClick={() => { rememberFocus(); setIntakeMode("project"); setIntakeOpen(true); }}>
             Begin your first world
           </button>
         </div>
@@ -2015,7 +2124,7 @@ export default function Orrery() {
 
       {/* index */}
       <div className="hud index-wrap">
-        <button className="ghost-btn sm" onClick={() => setIndexOpen((o) => { if (o) setIndexQuery(""); return !o; })}>
+        <button className="ghost-btn sm" onClick={() => { if (!indexOpen) rememberFocus(); setIndexOpen((o) => { if (o) setIndexQuery(""); return !o; }); }}>
           {indexOpen ? "Close index" : `Index · ${projects.length}`}
         </button>
         {indexOpen && (
@@ -2043,6 +2152,7 @@ export default function Orrery() {
                         key={t.id}
                         className="idx-task-row"
                         onClick={() => {
+                          rememberFocus();
                           setView({ mode: "planet", projectId: p.id });
                           setSelected({ projectId: p.id, taskId: t.id });
                           setIndexOpen(false);
@@ -2171,13 +2281,14 @@ export default function Orrery() {
             </button>
           )
         )}
-        <button className="ghost-btn sm" onClick={() => { setDebugOpen((o) => !o); setDbgConfirmClear(false); }} aria-label="Toggle debug panel">
+        <button className="ghost-btn sm" onClick={() => { if (!debugOpen) rememberFocus(); setDebugOpen((o) => !o); setDbgConfirmClear(false); }} aria-label="Toggle debug panel">
           ⚙ debug
         </button>
         <button className="ghost-btn" onClick={cycleSound} aria-label="Cycle ambient sound mode">
           {soundMode === "off" ? "♪ sound off" : soundMode === "ambient" ? "♪ ambient hum" : "♪ soft strings"}
         </button>
         <button className="primary-btn" onClick={() => {
+          rememberFocus();
           setIntakeMode(projects.length ? "task" : "project");
           if (projects.length && !fTaskProject) setFTaskProject(view.projectId || projects[0].id);
           setIntakeOpen(true);
