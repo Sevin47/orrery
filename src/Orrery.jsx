@@ -377,6 +377,56 @@ function glowTexture(rgb = "160,190,255") {
   return t;
 }
 
+// Patches a chunk's MeshStandardMaterial so its per-vertex `cityLight`
+// attribute (0..1, baked in alongside terrain color) only actually glows on
+// the side facing away from the star — real emissive is direction-independent
+// by design, so getting a night-only glow means computing our own day/night
+// factor in the shader. The star always sits at the world origin (see the
+// `sunLight` setup), so the direction from any surface point back to it is
+// just `normalize(-worldPos)` — no per-frame uniform to keep in sync, it
+// falls out of the geometry every frame for free as the planet spins/orbits.
+function addNightGlow(material, glowColor) {
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uCityGlowColor = { value: glowColor };
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        "#include <common>",
+        `#include <common>
+         attribute float cityLight;
+         varying float vCityLight;
+         varying vec3 vWorldNormalCity;
+         varying vec3 vWorldPosCity;`
+      )
+      .replace(
+        "#include <begin_vertex>",
+        `#include <begin_vertex>
+         vCityLight = cityLight;
+         vWorldNormalCity = normalize( mat3( modelMatrix ) * normal );
+         vWorldPosCity = ( modelMatrix * vec4( position, 1.0 ) ).xyz;`
+      );
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        "#include <common>",
+        `#include <common>
+         uniform vec3 uCityGlowColor;
+         varying float vCityLight;
+         varying vec3 vWorldNormalCity;
+         varying vec3 vWorldPosCity;`
+      )
+      .replace(
+        "#include <dithering_fragment>",
+        `float ndlCity = dot( normalize( vWorldNormalCity ), normalize( -vWorldPosCity ) );
+         float nightCity = smoothstep( 0.05, -0.2, ndlCity );
+         gl_FragColor.rgb += uCityGlowColor * vCityLight * nightCity;
+         #include <dithering_fragment>`
+      );
+  };
+  // every chunk's injected shader source is identical (only the per-instance
+  // attribute/uniform data differs), so sharing one program cache key lets
+  // three.js reuse a single compiled program across all of them
+  material.customProgramCacheKey = () => "cityNightGlow";
+}
+
 /* ---------------- planet construction ----------------
  * Split into a cheap "shell" (always built, for every project, even at
  * 100+ concurrent planets) and an expensive "detail" layer (full per-vertex
@@ -484,12 +534,19 @@ function attachPlanetDetail(rec, project) {
 
     if (Math.abs(lat) > capSize * (Math.PI / 2)) { light += 0.26; sat *= 0.5; }
 
+    // scattered "cities of light" — a faint daytime fleck (glass/pavement),
+    // but the real payoff is cityAmt feeding the night-side emissive glow
+    // (see addNightGlow) so they actually look like city lights after dark.
     const sparkle = mulberry32(strHash(project.id + dir.x.toFixed(2) + dir.y.toFixed(2) + dir.z.toFixed(2)))();
-    if (continent > 0 && sparkle > 0.965) light += 0.16; // scattered "cities of light"
+    let cityAmt = 0;
+    if (continent > 0 && sparkle > 0.965) {
+      light += 0.05;
+      cityAmt = smoothstep(0.965, 0.995, sparkle);
+    }
 
     const col = new THREE.Color();
     col.setHSL(((hue % 1) + 1) % 1, clamp(sat, 0.15, 0.92), clamp(light, 0.08, 0.88));
-    return col;
+    return { col, cityAmt };
   };
 
   if (doneTasks.length === 0) {
@@ -529,14 +586,16 @@ function attachPlanetDetail(rec, project) {
     const unit = getUnitSphere();
     const vCount = unit.vCount;
     const baseColors = new Float32Array(vCount * 3);
+    const baseCity = new Float32Array(vCount);
     const vTmp = new THREE.Vector3();
     for (let i = 0; i < vCount; i++) {
       vTmp.set(unit.dirs[i * 3], unit.dirs[i * 3 + 1], unit.dirs[i * 3 + 2]);
-      const col = terrainColor(vTmp);
+      const { col, cityAmt } = terrainColor(vTmp);
       baseColors[i * 3] = col.r; baseColors[i * 3 + 1] = col.g; baseColors[i * 3 + 2] = col.b;
+      baseCity[i] = cityAmt;
     }
 
-    const buckets = seeds.map(() => ({ map: new Map(), positions: [], normalsArr: [], colorsArr: [], indices: [] }));
+    const buckets = seeds.map(() => ({ map: new Map(), positions: [], normalsArr: [], colorsArr: [], cityArr: [], indices: [] }));
     const cen = new THREE.Vector3();
     const d0 = new THREE.Vector3(), d1 = new THREE.Vector3(), d2 = new THREE.Vector3();
     for (let f = 0; f < unit.faceCount; f++) {
@@ -559,6 +618,7 @@ function attachPlanetDetail(rec, project) {
           b.positions.push(unit.dirs[orig * 3] * R, unit.dirs[orig * 3 + 1] * R, unit.dirs[orig * 3 + 2] * R);
           b.normalsArr.push(unit.dirs[orig * 3], unit.dirs[orig * 3 + 1], unit.dirs[orig * 3 + 2]);
           b.colorsArr.push(baseColors[orig * 3], baseColors[orig * 3 + 1], baseColors[orig * 3 + 2]);
+          b.cityArr.push(baseCity[orig]);
         }
         return li;
       });
@@ -572,10 +632,12 @@ function attachPlanetDetail(rec, project) {
       geo.setAttribute("position", new THREE.Float32BufferAttribute(b.positions, 3));
       geo.setAttribute("normal", new THREE.Float32BufferAttribute(b.normalsArr, 3));
       geo.setAttribute("color", new THREE.Float32BufferAttribute(b.colorsArr, 3));
+      geo.setAttribute("cityLight", new THREE.Float32BufferAttribute(b.cityArr, 1));
       geo.setIndex(b.indices);
       const mat = new THREE.MeshStandardMaterial({
         vertexColors: true, roughness: 0.78, metalness: 0.06, emissive: 0x000000,
       });
+      addNightGlow(mat, new THREE.Color(1.0, 0.82, 0.5));
       const mesh = new THREE.Mesh(geo, mat);
       mesh.userData.taskId = doneTasks[i] ? doneTasks[i].id : null;
       spin.add(mesh);
@@ -1076,8 +1138,14 @@ export default function Orrery() {
     renderer.setSize(mount.clientWidth, mount.clientHeight);
     mount.appendChild(renderer.domElement);
 
-    scene.add(new THREE.AmbientLight(0x30395c, 1.8));
-    const rim = new THREE.PointLight(0x6a7dff, 0.9, 200);
+    // Kept low on purpose — this is the ceiling on how dark a planet's night
+    // side can ever get. Bright enough that the unlit hemisphere still reads
+    // as a planet and not a black silhouette; dim enough that the star's
+    // PointLight below remains the dominant, visible shaping light, so a real
+    // day/night terminator shows up as a planet spins and orbits instead of
+    // being washed out into flat, direction-independent lighting.
+    scene.add(new THREE.AmbientLight(0x30395c, 0.45));
+    const rim = new THREE.PointLight(0x6a7dff, 0.18, 200);
     rim.position.set(-40, -10, -30);
     scene.add(rim);
 
@@ -1096,7 +1164,13 @@ export default function Orrery() {
     }));
     sunGlow.scale.set(STAR_RADIUS * 6, STAR_RADIUS * 6, 1);
     scene.add(sunGlow);
-    const sunLight = new THREE.PointLight(0xfff2df, 3.2, 0, 1.15);
+    // Intensity/decay tuned so the terminator stays visible across the whole
+    // orbit-radius range the galaxy layout produces (tens to a few hundred
+    // units out), not just for planets near the star. A physically-correct
+    // decay of 2 would leave outer planets essentially unlit next to the
+    // ambient floor above; this softer falloff keeps the sun the dominant
+    // light at any distance a focused planet is likely to sit.
+    const sunLight = new THREE.PointLight(0xfff2df, 20, 0, 0.6);
     sunLight.position.set(0, 0, 0);
     scene.add(sunLight);
 
