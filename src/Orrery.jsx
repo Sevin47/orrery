@@ -344,6 +344,15 @@ function vertexNormalsFromPositions(posAttr) {
 // detail 15 was ~4.3° per tooth (visibly jagged when exploded); 60 is ~1.1°.
 const PLANET_DETAIL = 60;
 
+// How far terrain height actually pushes a vertex, as a fraction of the
+// planet's radius (see attachPlanetDetail's height/displacement pass). Real
+// displacement rather than a faked normal — a first attempt perturbed only
+// the shading normal via a per-vertex tangent frame, which looked like
+// streaky faceted plastic wrap because that frame isn't consistent between
+// neighboring vertices. Actually moving the vertex and recomputing normals
+// from the real (displaced) triangle topology has no such discontinuity.
+const TERRAIN_DISPLACEMENT = 0.045;
+
 // IcosahedronGeometry + mergeVertices is expensive (the dominant cost of a planet
 // rebuild) but topology-only — every planet uses the same detail level, and R just
 // scales it. Build the indexed unit sphere once and reuse its index/directions for
@@ -373,6 +382,37 @@ function glowTexture(rgb = "160,190,255") {
   gr.addColorStop(1, `rgba(${rgb},0)`);
   g.fillStyle = gr;
   g.fillRect(0, 0, 256, 256);
+  const t = new THREE.CanvasTexture(c);
+  return t;
+}
+
+// Procedural equirectangular cloud-coverage texture — reuses the same
+// sphereFBM noise the terrain itself is built from (see attachPlanetDetail),
+// so clouds read as part of the same visual language instead of a bolted-on
+// effect. Alpha-only coverage; the mesh's own color stays flat white and
+// picks up real shading from the scene's lights, same as the terrain.
+function cloudTexture(rng) {
+  const w = 256, h = 128;
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const g = c.getContext("2d");
+  const img = g.createImageData(w, h);
+  const cloudAxes = makeNoiseAxes(rng, 4, 2.2);
+  const dir = new THREE.Vector3();
+  for (let y = 0; y < h; y++) {
+    const lat = (y / h - 0.5) * Math.PI;
+    const cosLat = Math.cos(lat), sinLat = Math.sin(lat);
+    for (let x = 0; x < w; x++) {
+      const lon = (x / w) * Math.PI * 2 - Math.PI;
+      dir.set(cosLat * Math.cos(lon), sinLat, cosLat * Math.sin(lon));
+      const n = sphereFBM(dir, cloudAxes);
+      const coverage = smoothstep(0.18, 0.6, n); // sparse and wispy, not overcast
+      const idx = (y * w + x) * 4;
+      img.data[idx] = 255; img.data[idx + 1] = 255; img.data[idx + 2] = 255;
+      img.data[idx + 3] = Math.round(coverage * 230);
+    }
+  }
+  g.putImageData(img, 0, 0);
   const t = new THREE.CanvasTexture(c);
   return t;
 }
@@ -482,6 +522,7 @@ function buildPlanetShell(project, orbit) {
     R, pal, sig: signature(project), detailBuilt: false,
     explode: 0, spinAngle: Math.random() * Math.PI * 2,
     spinSpeed: 0.05 + rng() * 0.05,
+    clouds: null, cloudAngle: 0, cloudSpeed: 0, // set when detail (and its cloud shell) attach
     orbitRadius: orbit.radius, orbitY: orbit.y, orbitAngle: orbit.phase,
     orbitSpeed: orbitSpeedFor(orbit.radius),
   };
@@ -549,6 +590,28 @@ function attachPlanetDetail(rec, project) {
     return { col, cityAmt };
   };
 
+  // Feeds the fake bump-mapped normals below — same continent/mountain/crater
+  // shape language as terrainColor's `light` term above, but as literal
+  // elevation rather than color lightness, so the two stay visually
+  // consistent (what reads brighter also reads raised; what reads darker
+  // also reads sunken).
+  const heightAt = (dir) => {
+    const lat = Math.asin(clamp(dir.y, -1, 1));
+    const continent = sphereFBM(dir, continentAxes);
+    const mountain = sphereFBM(dir, mountainAxes);
+    const landAmt = smoothstep(-0.05, 0.25, continent);
+    let h = continent * 0.5 + mountain * landAmt * 0.7;
+    for (let i = 0; i < craters.length; i++) {
+      const c = craters[i];
+      const d = Math.acos(clamp(dir.dot(c.center), -1, 1)) / c.radius;
+      if (d < 1) {
+        h += -0.45 * (1 - smoothstep(0, 0.55, d)) + 0.3 * Math.exp(-Math.pow((d - 0.82) / 0.12, 2));
+      }
+    }
+    if (Math.abs(lat) > capSize * (Math.PI / 2)) h += 0.12;
+    return h;
+  };
+
   if (doneTasks.length === 0) {
     // newborn molten core — smooth sphere with mottled lava-noise coloring
     const coreR = 0.85;
@@ -587,12 +650,56 @@ function attachPlanetDetail(rec, project) {
     const vCount = unit.vCount;
     const baseColors = new Float32Array(vCount * 3);
     const baseCity = new Float32Array(vCount);
+    // Real vertex displacement rather than a faked shading normal — push
+    // each vertex out (mountains) or in (craters) along its own radius by
+    // the height field, scaled small relative to R. Zero added triangles,
+    // same topology as before, just moved.
+    const baseDispPos = new Float32Array(vCount * 3);
     const vTmp = new THREE.Vector3();
     for (let i = 0; i < vCount; i++) {
       vTmp.set(unit.dirs[i * 3], unit.dirs[i * 3 + 1], unit.dirs[i * 3 + 2]);
       const { col, cityAmt } = terrainColor(vTmp);
       baseColors[i * 3] = col.r; baseColors[i * 3 + 1] = col.g; baseColors[i * 3 + 2] = col.b;
       baseCity[i] = cityAmt;
+
+      const h = clamp(heightAt(vTmp), -1.3, 1.6);
+      const rr = R * (1 + h * TERRAIN_DISPLACEMENT);
+      baseDispPos[i * 3] = vTmp.x * rr;
+      baseDispPos[i * 3 + 1] = vTmp.y * rr;
+      baseDispPos[i * 3 + 2] = vTmp.z * rr;
+    }
+
+    // Normals computed from the REAL displaced triangle topology — this is
+    // what avoided the streaky-plastic artifact a faked tangent-space
+    // perturbation produced: every vertex's normal is the area-weighted
+    // average of its actual (now-bumpy) neighboring faces, computed globally
+    // across the whole shared sphere (not per task-chunk bucket), so chunk
+    // seams stay as continuous as the color/city data already pushed above.
+    const baseNormal = new Float32Array(vCount * 3);
+    const fa = new THREE.Vector3(), fb = new THREE.Vector3(), fc = new THREE.Vector3();
+    const fe1 = new THREE.Vector3(), fe2 = new THREE.Vector3(), faceN = new THREE.Vector3();
+    for (let f = 0; f < unit.faceCount; f++) {
+      const i0 = unit.index[f * 3], i1 = unit.index[f * 3 + 1], i2 = unit.index[f * 3 + 2];
+      fa.set(baseDispPos[i0 * 3], baseDispPos[i0 * 3 + 1], baseDispPos[i0 * 3 + 2]);
+      fb.set(baseDispPos[i1 * 3], baseDispPos[i1 * 3 + 1], baseDispPos[i1 * 3 + 2]);
+      fc.set(baseDispPos[i2 * 3], baseDispPos[i2 * 3 + 1], baseDispPos[i2 * 3 + 2]);
+      fe1.subVectors(fb, fa);
+      fe2.subVectors(fc, fa);
+      faceN.crossVectors(fe1, fe2); // left unnormalized so bigger faces weigh in more
+      baseNormal[i0 * 3] += faceN.x; baseNormal[i0 * 3 + 1] += faceN.y; baseNormal[i0 * 3 + 2] += faceN.z;
+      baseNormal[i1 * 3] += faceN.x; baseNormal[i1 * 3 + 1] += faceN.y; baseNormal[i1 * 3 + 2] += faceN.z;
+      baseNormal[i2 * 3] += faceN.x; baseNormal[i2 * 3 + 1] += faceN.y; baseNormal[i2 * 3 + 2] += faceN.z;
+    }
+    for (let i = 0; i < vCount; i++) {
+      let nx = baseNormal[i * 3], ny = baseNormal[i * 3 + 1], nz = baseNormal[i * 3 + 2];
+      const nLen = Math.hypot(nx, ny, nz) || 1;
+      nx /= nLen; ny /= nLen; nz /= nLen;
+      // guard against a winding-order surprise flipping a normal inward —
+      // it should always point roughly outward, same side as the vertex itself
+      if (nx * unit.dirs[i * 3] + ny * unit.dirs[i * 3 + 1] + nz * unit.dirs[i * 3 + 2] < 0) {
+        nx = -nx; ny = -ny; nz = -nz;
+      }
+      baseNormal[i * 3] = nx; baseNormal[i * 3 + 1] = ny; baseNormal[i * 3 + 2] = nz;
     }
 
     const buckets = seeds.map(() => ({ map: new Map(), positions: [], normalsArr: [], colorsArr: [], cityArr: [], indices: [] }));
@@ -615,8 +722,8 @@ function attachPlanetDetail(rec, project) {
         if (li === undefined) {
           li = b.positions.length / 3;
           b.map.set(orig, li);
-          b.positions.push(unit.dirs[orig * 3] * R, unit.dirs[orig * 3 + 1] * R, unit.dirs[orig * 3 + 2] * R);
-          b.normalsArr.push(unit.dirs[orig * 3], unit.dirs[orig * 3 + 1], unit.dirs[orig * 3 + 2]);
+          b.positions.push(baseDispPos[orig * 3], baseDispPos[orig * 3 + 1], baseDispPos[orig * 3 + 2]);
+          b.normalsArr.push(baseNormal[orig * 3], baseNormal[orig * 3 + 1], baseNormal[orig * 3 + 2]);
           b.colorsArr.push(baseColors[orig * 3], baseColors[orig * 3 + 1], baseColors[orig * 3 + 2]);
           b.cityArr.push(baseCity[orig]);
         }
@@ -643,6 +750,24 @@ function attachPlanetDetail(rec, project) {
       spin.add(mesh);
       chunks.push({ mesh, dir: dir.clone(), task: doneTasks[i] || null });
     });
+
+    // thin translucent cloud shell — drifts independently of the terrain's
+    // own spin (see the animate loop) for a "living planet" parallax cue,
+    // and is lit by the same scene lights as the terrain so it picks up the
+    // same day/night shading rather than looking pasted on. Parented to
+    // `group` rather than `spin` specifically so its rotation is free of
+    // spin's per-frame absolute assignment.
+    const cloudGeo = new THREE.SphereGeometry(R * 1.045, 32, 20);
+    const cloudMat = new THREE.MeshStandardMaterial({
+      map: cloudTexture(rng),
+      transparent: true, depthWrite: false,
+      roughness: 1, metalness: 0,
+    });
+    const clouds = new THREE.Mesh(cloudGeo, cloudMat);
+    group.add(clouds);
+    rec.clouds = clouds;
+    rec.cloudAngle = rng() * Math.PI * 2;
+    rec.cloudSpeed = 0.015 + rng() * 0.02;
   }
 
   // (rings retired: they were a per-project 50% coin flip — decoration that
@@ -780,6 +905,11 @@ function detachPlanetDetail(rec) {
   if (!rec.detailBuilt) return;
   rec.chunks.forEach((c) => { rec.spin.remove(c.mesh); disposeThreeObject(c.mesh); });
   rec.dust.forEach((d) => { rec.group.remove(d.cluster); disposeThreeObject(d.cluster); });
+  if (rec.clouds) {
+    rec.group.remove(rec.clouds);
+    disposeThreeObject(rec.clouds);
+    rec.clouds = null;
+  }
   rec.chunks = [];
   rec.dust = [];
   rec.impostor.visible = true;
@@ -1287,6 +1417,10 @@ export default function Orrery() {
         else rec.explode += (target - rec.explode) * Math.min(1, dt * 2.4);
         rec.spinAngle += dt * rec.spinSpeed * motion * staleFactor * (1 - 0.75 * rec.explode);
         rec.spin.rotation.y = rec.spinAngle;
+        if (rec.clouds) {
+          rec.cloudAngle += dt * rec.cloudSpeed * motion * staleFactor;
+          rec.clouds.rotation.y = rec.cloudAngle;
+        }
         const amt = rec.explode * (rec.R * 0.55 + 0.45);
         rec.chunks.forEach((ch) => {
           if (ch.isCore) {
@@ -1528,7 +1662,7 @@ export default function Orrery() {
       const isFocused = viewRef.current.mode === "planet" && viewRef.current.projectId === p.id;
       let rec = world.planets.get(p.id);
       if (rec && rec.sig !== sig) {
-        const explode = rec.explode, spinAngle = rec.spinAngle, orbitAngle = rec.orbitAngle;
+        const explode = rec.explode, spinAngle = rec.spinAngle, orbitAngle = rec.orbitAngle, cloudAngle = rec.cloudAngle;
         world.scene.remove(rec.group);
         disposeRecord(rec);
         rec.label?.remove();
@@ -1546,7 +1680,11 @@ export default function Orrery() {
           fresh.label.textContent = p.name;
           galaxyLabelLayerRef.current.appendChild(fresh.label);
         }
-        if (isFocused) { attachPlanetDetail(fresh, p); buildTaskLabels(fresh); } // e.g. completing a task on the focused planet
+        if (isFocused) {
+          attachPlanetDetail(fresh, p); // e.g. completing a task on the focused planet
+          buildTaskLabels(fresh);
+          if (fresh.clouds) fresh.cloudAngle = cloudAngle; // keep drifting smoothly, don't snap back to a fresh phase
+        }
       } else if (!rec) {
         const fresh = buildPlanetShell(p, orbit);
         world.scene.add(fresh.group);
