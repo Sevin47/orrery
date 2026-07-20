@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import * as THREE from "three";
 import * as Tone from "tone";
 import { mergeVertices } from "three/examples/jsm/utils/BufferGeometryUtils.js";
-import { supabase, loadCloudProjects, saveCloudProjects } from "./supabaseClient.js";
+import { supabase, loadCloudState, saveCloudState } from "./supabaseClient.js";
 
 // Injected by .github/workflows/deploy.yml at build time (VITE_-prefixed env
 // vars are auto-exposed by Vite); falls back to "dev" for local `npm run dev`.
@@ -262,30 +262,76 @@ function dustQuadGlyph(quad, overdue) {
 function dustQuadSpeed(quad, overdue) {
   return DUST_QUAD_SPEED[quad] * (overdue && (quad === "q1" || quad === "q3") ? OVERDUE_SPEED_BOOST : 1);
 }
-// Project archetypes — the user's five real work categories. This slice they
-// only drive intake pre-fills (default importance, and exec fire drills
-// pre-filling due = today so capture stays title + Enter); later slices may
-// hang dust behavior or triage ordering off them.
-const ARCHETYPES = [
-  { key: "general", label: "General", importantDefault: true, dueToday: false },
-  { key: "exec", label: "Executive Ad-Hoc", importantDefault: true, dueToday: true },
-  { key: "flagship", label: "Flagship Deliverable", importantDefault: true, dueToday: false },
-  // individual routine maintenance tasks are the classic "the program matters,
-  // each task doesn't" case — overdue ones read Q3 (contain), not false-alarm
-  // Q1; one tap promotes exceptions.
-  { key: "maintenance", label: "Database Maintenance", importantDefault: false, dueToday: false },
-  { key: "sprint", label: "Application Sprint", importantDefault: true, dueToday: false },
-  { key: "governance", label: "Governance & Compliance", importantDefault: true, dueToday: false },
-];
-function archetypeFor(project) {
-  return ARCHETYPES.find((a) => a.key === project?.archetype) || ARCHETYPES[0];
-}
 function todayISO(offsetDays = 0) {
   const d = new Date(Date.now() + offsetDays * 24 * 60 * 60 * 1000);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 function uid() {
   return (crypto?.randomUUID?.() || Date.now() + "-" + Math.random().toString(36).slice(2));
+}
+
+// Origin/Requestor (who asked for the work, project-level) and Discipline
+// Classification (what kind of work, task-level — one project can genuinely
+// span disciplines, so this can't live on the project) replace the old
+// single hardcoded "Work Type" archetype list. Both lists are fully
+// user-configurable at runtime (see the Classifications settings panel) —
+// these are just the seeded starting points, not a fixed enum. Every seed
+// option defaults importantDefault:false — importance is always a deliberate
+// per-task human choice, never auto-prefilled, even for Ad-Hoc (a lot of
+// ad-hoc requests are medium/low priority). Ad-Hoc keeps dueToday:true as
+// the one direct behavioral carryover from the old "Executive Ad-Hoc"
+// archetype — a due-date convenience, not an importance judgment.
+const DEFAULT_ORIGIN_OPTIONS = [
+  { key: uid(), label: "Cabinet Secretary", importantDefault: false, dueToday: false },
+  { key: uid(), label: "Internal Request", importantDefault: false, dueToday: false },
+  { key: uid(), label: "Public Request", importantDefault: false, dueToday: false },
+  { key: uid(), label: "Other Division Task", importantDefault: false, dueToday: false },
+];
+const DEFAULT_DISCIPLINE_OPTIONS = [
+  { key: uid(), label: "Ad-Hoc", importantDefault: false, dueToday: true },
+  { key: uid(), label: "Official Highway Maps", importantDefault: false, dueToday: false },
+  { key: uid(), label: "WVDOT Standards Mapping", importantDefault: false, dueToday: false },
+  { key: uid(), label: "Edits and Alignments", importantDefault: false, dueToday: false },
+  { key: uid(), label: "Web GIS", importantDefault: false, dueToday: false },
+];
+// Sentinels a project/task's origin/discipline key resolves to when unset OR
+// when it references an option the user has since deleted from the
+// configurable lists — deleting an in-use option is safe by construction:
+// the stored key just stops matching anything and falls here instead of
+// breaking, so there's no cascade-cleanup to do on delete.
+const UNSET_ORIGIN = { key: "__unset", label: "Unspecified", importantDefault: false, dueToday: false };
+const UNSET_DISCIPLINE = { key: "__unset", label: "Unspecified", importantDefault: false, dueToday: false };
+// Pure — list passed explicitly rather than closed over, so these stay
+// referentially stable and never need a dependency-array entry anywhere.
+function originFor(originOptions, project) {
+  return originOptions.find((o) => o.key === project?.origin) || UNSET_ORIGIN;
+}
+function disciplineByKey(disciplineOptions, key) {
+  return disciplineOptions.find((d) => d.key === key) || UNSET_DISCIPLINE;
+}
+function disciplineFor(disciplineOptions, task) {
+  return disciplineByKey(disciplineOptions, task?.discipline);
+}
+// The Supabase `galaxies.projects` JSONB column used to hold a bare projects
+// array; it now holds the richer {projects, originOptions, disciplineOptions}
+// object. Detects which shape a freshly-loaded row is in and upgrades old
+// rows in memory (never mutates the DB row itself — that happens the next
+// time this client saves). Anything that's neither shape (corrupt/partial
+// row) is treated as "no row yet," the same safe self-heal the caller
+// already does for a brand-new account.
+function normalizeCloudState(raw) {
+  if (Array.isArray(raw)) {
+    return { projects: raw, originOptions: DEFAULT_ORIGIN_OPTIONS, disciplineOptions: DEFAULT_DISCIPLINE_OPTIONS };
+  }
+  if (raw && Array.isArray(raw.projects)) {
+    return {
+      projects: raw.projects,
+      originOptions: Array.isArray(raw.originOptions) ? raw.originOptions : DEFAULT_ORIGIN_OPTIONS,
+      disciplineOptions: Array.isArray(raw.disciplineOptions) ? raw.disciplineOptions : DEFAULT_DISCIPLINE_OPTIONS,
+    };
+  }
+  console.warn("normalizeCloudState: unrecognized cloud row shape, treating as no row", raw);
+  return null;
 }
 function fmtDate(d) {
   if (!d) return null;
@@ -931,9 +977,16 @@ export default function Orrery() {
   const mountRef = useRef(null);
   const worldRef = useRef(null);
   const projectsRef = useRef([]);
+  // mirrored the same way projectsRef is — read by effects that deliberately
+  // exclude these from their dependency arrays (the prefill effect, the
+  // cloud-hydration effect) and so can't safely close over plain state.
+  const originOptionsRef = useRef(DEFAULT_ORIGIN_OPTIONS);
+  const disciplineOptionsRef = useRef(DEFAULT_DISCIPLINE_OPTIONS);
   const galaxyLabelLayerRef = useRef(null); // plain DOM labels for planet names, updated imperatively per-frame
   const taskLabelLayerRef = useRef(null); // plain DOM labels for task names on the focused planet
   const [projects, setProjects] = useState([]);
+  const [originOptions, setOriginOptions] = useState(DEFAULT_ORIGIN_OPTIONS);
+  const [disciplineOptions, setDisciplineOptions] = useState(DEFAULT_DISCIPLINE_OPTIONS);
   const [loaded, setLoaded] = useState(false);
   const [view, setView] = useState({ mode: "galaxy", projectId: null });
   const [selected, setSelected] = useState(null); // {projectId, taskId}
@@ -943,6 +996,7 @@ export default function Orrery() {
   const [indexOpen, setIndexOpen] = useState(false);
   const [indexQuery, setIndexQuery] = useState("");
   const [debugOpen, setDebugOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false); // Classifications (Origin/Requestor + Discipline) manager
   const [dbgCount, setDbgCount] = useState(10);
   const [dbgConfirmClear, setDbgConfirmClear] = useState(false);
   const [, setDebugTick] = useState(0); // forces the debug panel to re-read live world/project data
@@ -1000,7 +1054,7 @@ export default function Orrery() {
   const rememberFocus = useCallback(() => {
     overlayTriggerRef.current = document.activeElement;
   }, []);
-  const anyOverlayOpen = indexOpen || debugOpen || intakeOpen || !!selected;
+  const anyOverlayOpen = indexOpen || debugOpen || intakeOpen || settingsOpen || !!selected;
   const overlayWasOpenRef = useRef(false);
   useEffect(() => {
     if (!anyOverlayOpen && overlayWasOpenRef.current) {
@@ -1012,27 +1066,44 @@ export default function Orrery() {
   // form state
   const [fProjName, setFProjName] = useState("");
   const [fProjDesc, setFProjDesc] = useState("");
-  const [fProjArch, setFProjArch] = useState("general");
+  const [fProjOrigin, setFProjOrigin] = useState(DEFAULT_ORIGIN_OPTIONS[0].key);
   const [fTaskProject, setFTaskProject] = useState("");
   const [fTaskTitle, setFTaskTitle] = useState("");
   const [fTaskNotes, setFTaskNotes] = useState("");
   const [fTaskDue, setFTaskDue] = useState("");
   const [fImportant, setFImportant] = useState(true);
+  // Discipline defaults to the unset sentinel, NOT the first real option —
+  // if Ad-Hoc (dueToday:true) ended up first in the list, defaulting to it
+  // would silently prefill due=today before the user has looked at the
+  // field at all. Reset back to this after every task submit (see addTask)
+  // so the next task always forces a deliberate pick.
+  const [fTaskDiscipline, setFTaskDiscipline] = useState(UNSET_DISCIPLINE.key);
+  const [newOriginLabel, setNewOriginLabel] = useState("");
+  const [newDisciplineLabel, setNewDisciplineLabel] = useState("");
 
-  // archetype-driven intake prefills: picking a world resets the Important
-  // checkbox to that world's default, and exec (fire-drill) worlds pre-fill
-  // due = today so urgent capture stays title + Enter. Runs on world change
-  // only — it never overwrites edits made after the world is chosen. The
-  // just-created-world path can't rely on this effect (projectsRef doesn't
-  // include the new project yet when it fires), so addProject applies the
-  // same prefills itself.
+  // Origin/discipline-driven intake prefills: picking a world OR a discipline
+  // recomputes the Important checkbox and (only-ever-set, never-cleared)
+  // due-today prefill from BOTH classifications combined via OR — either one
+  // saying "important"/"due today" wins. Runs on either change only; it
+  // never overwrites a manual edit made without touching either field again.
+  // Accepted tradeoff: since this now has two triggers instead of one,
+  // correcting Discipline *after* manually unchecking Important can silently
+  // re-check it — same class of tradeoff that already existed for the
+  // world-only case, just with a second trigger now. Low real-world impact
+  // today since every seed option defaults importantDefault:false.
+  // The just-created-world path can't rely on this effect (projectsRef
+  // doesn't include the new project yet when it fires), so addProject
+  // applies the same prefill itself; addTask's post-submit reset does too,
+  // for the same reason (setting state to its current value doesn't
+  // retrigger an effect keyed on that state).
   useEffect(() => {
     const proj = projectsRef.current.find((p) => p.id === fTaskProject);
     if (!proj) return;
-    const arch = archetypeFor(proj);
-    setFImportant(arch.importantDefault);
-    if (arch.dueToday) setFTaskDue(todayISO());
-  }, [fTaskProject]);
+    const origin = originFor(originOptionsRef.current, proj);
+    const discipline = disciplineByKey(disciplineOptionsRef.current, fTaskDiscipline);
+    setFImportant(origin.importantDefault || discipline.importantDefault);
+    if (origin.dueToday || discipline.dueToday) setFTaskDue(todayISO());
+  }, [fTaskProject, fTaskDiscipline]);
 
   /* ---------- persistence (localStorage) ---------- */
   useEffect(() => {
@@ -1041,18 +1112,22 @@ export default function Orrery() {
       if (raw) {
         const data = JSON.parse(raw);
         if (Array.isArray(data.projects)) setProjects(data.projects);
+        if (Array.isArray(data.originOptions)) setOriginOptions(data.originOptions);
+        if (Array.isArray(data.disciplineOptions)) setDisciplineOptions(data.disciplineOptions);
       }
     } catch (e) { /* first visit — nothing saved yet */ }
     setLoaded(true);
   }, []);
   useEffect(() => {
     projectsRef.current = projects;
+    originOptionsRef.current = originOptions;
+    disciplineOptionsRef.current = disciplineOptions;
     if (!loaded) return;
     const t = setTimeout(() => {
       try {
-        localStorage.setItem("orrery_galaxy_v1", JSON.stringify({ projects }));
+        localStorage.setItem("orrery_galaxy_v1", JSON.stringify({ projects, originOptions, disciplineOptions }));
         if (user) {
-          saveCloudProjects(user.id, projects)
+          saveCloudState(user.id, { projects, originOptions, disciplineOptions })
             .then(() => { setSaveNote("synced"); setTimeout(() => setSaveNote(""), 1500); })
             .catch(() => { setSaveNote("sync failed"); setTimeout(() => setSaveNote(""), 2500); });
         } else {
@@ -1064,7 +1139,7 @@ export default function Orrery() {
       }
     }, 600);
     return () => clearTimeout(t);
-  }, [projects, loaded, user]);
+  }, [projects, originOptions, disciplineOptions, loaded, user]);
 
   /* ---------- cloud sync (Supabase, optional) ---------- */
   // Hydrates auth state; entirely inert if VITE_SUPABASE_* env vars are
@@ -1108,14 +1183,23 @@ export default function Orrery() {
     let cancelled = false;
     (async () => {
       try {
-        const cloudProjects = await loadCloudProjects(user.id);
+        const raw = await loadCloudState(user.id);
         if (cancelled) return;
-        if (cloudProjects === null) {
-          await saveCloudProjects(user.id, projectsRef.current);
+        const cloudState = raw === null ? null : normalizeCloudState(raw);
+        if (cloudState === null) {
+          // brand-new account, or a corrupt/unrecognized row (normalizeCloudState
+          // already warned) — either way, push today's local state up as the seed.
+          await saveCloudState(user.id, {
+            projects: projectsRef.current,
+            originOptions: originOptionsRef.current,
+            disciplineOptions: disciplineOptionsRef.current,
+          });
         } else {
-          setProjects(cloudProjects);
+          setProjects(cloudState.projects);
+          setOriginOptions(cloudState.originOptions);
+          setDisciplineOptions(cloudState.disciplineOptions);
           // mirror immediately so a previous account's cache can't linger
-          try { localStorage.setItem("orrery_galaxy_v1", JSON.stringify({ projects: cloudProjects })); } catch (e) { /* best-effort cache */ }
+          try { localStorage.setItem("orrery_galaxy_v1", JSON.stringify(cloudState)); } catch (e) { /* best-effort cache */ }
         }
       } catch (e) {
         setSaveNote("sync failed");
@@ -2039,39 +2123,68 @@ export default function Orrery() {
     });
   }, []);
 
+  /* ---------- classification list management (Origin/Requestor, Discipline) ---------- */
+  // Shared by both lists — they're identical in shape, so one small set of
+  // helpers beats duplicating add/update/delete for each. Deleting an
+  // in-use option is safe by construction: originFor/disciplineFor already
+  // fall back to the Unspecified sentinel for any key that doesn't match,
+  // so no cascade-cleanup of existing projects/tasks is needed here.
+  const updateOption = (setList, key, patch) => {
+    setList((list) => list.map((o) => (o.key === key ? { ...o, ...patch } : o)));
+  };
+  const deleteOption = (setList, key) => {
+    setList((list) => list.filter((o) => o.key !== key));
+  };
+  const addOption = (setList, label, resetLabel) => {
+    const trimmed = label.trim();
+    if (!trimmed) return;
+    setList((list) => [...list, { key: uid(), label: trimmed, importantDefault: false, dueToday: false }]);
+    resetLabel("");
+  };
+
   /* ---------- data actions ---------- */
   const addProject = useCallback(() => {
     const name = fProjName.trim();
     if (!name) return;
-    const p = { id: uid(), name, desc: fProjDesc.trim(), archetype: fProjArch, createdAt: Date.now(), tasks: [] };
+    const p = { id: uid(), name, desc: fProjDesc.trim(), origin: fProjOrigin, createdAt: Date.now(), tasks: [] };
     setProjects((ps) => [...ps, p]);
-    setFProjName(""); setFProjDesc(""); setFProjArch("general");
+    setFProjName(""); setFProjDesc("");
+    setFProjOrigin(originOptions[0]?.key || UNSET_ORIGIN.key);
     setIntakeMode("task");
     setFTaskProject(p.id);
     // fly the camera to the new world instead of leaving it back on the wide
     // galaxy shot — the intake modal stays open, re-scoped to this project's
     // task form, so you watch it while adding its first task
     setView({ mode: "planet", projectId: p.id });
-    // apply this archetype's task prefills directly — the world-change effect
-    // can't see the new project in projectsRef yet (see its comment)
-    const arch = archetypeFor(p);
-    setFImportant(arch.importantDefault);
-    setFTaskDue(arch.dueToday ? todayISO() : "");
-  }, [fProjName, fProjDesc, fProjArch]);
+    // apply this origin's task prefill directly — the world-change effect
+    // can't see the new project in projectsRef yet (see its comment). No
+    // discipline is involved yet — it's chosen fresh in the task form that's
+    // about to open.
+    const origin = originFor(originOptions, p);
+    setFImportant(origin.importantDefault);
+    setFTaskDue(origin.dueToday ? todayISO() : "");
+  }, [fProjName, fProjDesc, fProjOrigin, originOptions]);
 
   const addTask = useCallback(() => {
     const title = fTaskTitle.trim();
     if (!title || !fTaskProject) return;
+    const discipline = fTaskDiscipline === UNSET_DISCIPLINE.key ? null : fTaskDiscipline;
     setProjects((ps) => ps.map((p) => p.id === fTaskProject
-      ? { ...p, tasks: [...p.tasks, { id: uid(), title, notes: fTaskNotes.trim(), due: fTaskDue || null, important: fImportant, done: false, createdAt: Date.now(), completedAt: null }] }
+      ? { ...p, tasks: [...p.tasks, { id: uid(), title, notes: fTaskNotes.trim(), due: fTaskDue || null, important: fImportant, done: false, discipline, createdAt: Date.now(), completedAt: null }] }
       : p));
-    // reset back to the selected world's archetype defaults (not bare blanks),
-    // so back-to-back captures on a fire-drill world keep their prefills
-    const arch = archetypeFor(projectsRef.current.find((p) => p.id === fTaskProject));
+    // Reset back to the selected world's combined origin+discipline defaults
+    // (not bare blanks), so back-to-back captures on the same world keep
+    // their origin-driven prefill — mirrors addProject's reasoning, since
+    // setting fTaskProject/fTaskDiscipline to their current values wouldn't
+    // retrigger the prefill effect above. Discipline itself always resets to
+    // the unset sentinel (confirmed with the user) so the next task forces a
+    // deliberate pick rather than silently inheriting this one's discipline.
+    const origin = originFor(originOptions, projectsRef.current.find((p) => p.id === fTaskProject));
     setFTaskTitle(""); setFTaskNotes("");
-    setFTaskDue(arch.dueToday ? todayISO() : "");
-    setFImportant(arch.importantDefault);
-  }, [fTaskTitle, fTaskNotes, fTaskDue, fTaskProject, fImportant]);
+    setFTaskDue(origin.dueToday ? todayISO() : "");
+    setFImportant(origin.importantDefault);
+    setFTaskDiscipline(UNSET_DISCIPLINE.key);
+  }, [fTaskTitle, fTaskNotes, fTaskDue, fTaskProject, fTaskDiscipline, fImportant, originOptions]);
 
   const completeTask = useCallback((projectId, taskId) => {
     const world = worldRef.current;
@@ -2139,11 +2252,16 @@ export default function Orrery() {
     id: uid(), title: `Debug task ${i + 1}`, notes: "",
     due: done ? null : (i % 4 === 0 ? todayISO(-1) : i % 4 === 1 ? todayISO(2) : null),
     important: i % 3 !== 0,
+    // random discipline (or none) purely so seeded data exercises the field
+    // for visual verification — real capture always forces a deliberate pick
+    discipline: disciplineOptions.length && Math.random() > 0.2
+      ? disciplineOptions[Math.floor(Math.random() * disciplineOptions.length)].key
+      : null,
     done, createdAt: Date.now(), completedAt: done ? Date.now() : null,
   }));
   const dbgAddOpenTasks = useCallback((projectId, count) => {
     setProjects((ps) => ps.map((p) => p.id !== projectId ? p : { ...p, tasks: [...p.tasks, ...dbgMakeTasks(count, false)] }));
-  }, []);
+  }, [disciplineOptions]);
   const dbgCompleteAllOpen = useCallback((projectId) => {
     setProjects((ps) => ps.map((p) => p.id !== projectId ? p : {
       ...p, tasks: p.tasks.map((t) => t.done ? t : { ...t, done: true, completedAt: Date.now() }),
@@ -2159,14 +2277,15 @@ export default function Orrery() {
     const done = Math.floor(Math.random() * 45);
     const open = Math.floor(Math.random() * 6);
     const name = label || `${dbgRandomProjectNames[Math.floor(Math.random() * dbgRandomProjectNames.length)]} ${Math.floor(Math.random() * 1000)}`;
-    return { id: uid(), name, desc: "debug-generated", createdAt: Date.now(), tasks: [...dbgMakeTasks(done, true), ...dbgMakeTasks(open, false)] };
+    const origin = originOptions.length ? originOptions[Math.floor(Math.random() * originOptions.length)].key : null;
+    return { id: uid(), name, desc: "debug-generated", origin, createdAt: Date.now(), tasks: [...dbgMakeTasks(done, true), ...dbgMakeTasks(open, false)] };
   };
   const dbgAddRandomProject = useCallback(() => {
     setProjects((ps) => [...ps, dbgMakeRandomProject()]);
-  }, []);
+  }, [originOptions, disciplineOptions]);
   const dbgStressTest = useCallback(() => {
     setProjects((ps) => [...ps, ...Array.from({ length: 8 }, (_, i) => dbgMakeRandomProject(`Stress ${i}`))]);
-  }, []);
+  }, [originOptions, disciplineOptions]);
   const dbgClearAll = useCallback(() => {
     setDbgConfirmClear(false);
     setSelected(null);
@@ -2227,6 +2346,9 @@ export default function Orrery() {
         <div className="hud project-head">
           <div className="ph-name">{focusProject.name}</div>
           {focusProject.desc ? <div className="ph-desc">{focusProject.desc}</div> : null}
+          {originFor(originOptions, focusProject) !== UNSET_ORIGIN && (
+            <div className="ph-origin">Origin: {originFor(originOptions, focusProject).label}</div>
+          )}
           <div className="ph-meta">
             {focusProject.tasks.filter((t) => t.done).length} of {focusProject.tasks.length} crystallized
             {focusProject.tasks.length > 0 && focusProject.tasks.every((t) => t.done) && (
@@ -2269,6 +2391,9 @@ export default function Orrery() {
           <div className="d-title">{selTask.title}</div>
           {selTask.notes ? <div className="d-notes">{selTask.notes}</div> : null}
           <div className="d-rows">
+            {disciplineFor(disciplineOptions, selTask) !== UNSET_DISCIPLINE && (
+              <div className="d-row">Discipline: {disciplineFor(disciplineOptions, selTask).label}</div>
+            )}
             {selTask.due && (
               <div className={"d-row" + (overdue(selTask) ? " warn" : "")}>
                 Due {fmtDate(selTask.due)}{overdue(selTask) ? " · past due" : ""}
@@ -2374,7 +2499,10 @@ export default function Orrery() {
                         <span className={"idx-task-title" + sev + (isOverdue ? " overdue" : "") + (t.done ? " done" : "")}>
                           {!t.done ? dustQuadGlyph(quad, isOverdue) : ""}{t.title}
                         </span>
-                        <span className="idx-task-sub">{p.name}</span>
+                        <span className="idx-task-sub">
+                          {p.name}
+                          {disciplineFor(disciplineOptions, t) !== UNSET_DISCIPLINE && ` · ${disciplineFor(disciplineOptions, t).label}`}
+                        </span>
                       </button>
                     );
                   })}
@@ -2413,6 +2541,99 @@ export default function Orrery() {
           </div>
         )}
       </div>
+
+      {/* classifications settings modal */}
+      {settingsOpen && (
+        <div className="scrim" onClick={(e) => { if (e.target === e.currentTarget) setSettingsOpen(false); }}>
+          <div className="modal" role="dialog" aria-label="Classifications">
+            <div className="m-body">
+              <label className="f-label">Origin/Requestor</label>
+              {originOptions.map((o) => (
+                <div key={o.key} className="cls-row">
+                  <input
+                    className="f-input cls-label"
+                    value={o.label}
+                    onChange={(e) => updateOption(setOriginOptions, o.key, { label: e.target.value })}
+                  />
+                  <label className="cls-flag">
+                    <input
+                      type="checkbox"
+                      checked={o.importantDefault}
+                      onChange={(e) => updateOption(setOriginOptions, o.key, { importantDefault: e.target.checked })}
+                    />
+                    important
+                  </label>
+                  <label className="cls-flag">
+                    <input
+                      type="checkbox"
+                      checked={o.dueToday}
+                      onChange={(e) => updateOption(setOriginOptions, o.key, { dueToday: e.target.checked })}
+                    />
+                    due today
+                  </label>
+                  <button className="danger-btn sm" onClick={() => deleteOption(setOriginOptions, o.key)}>Delete</button>
+                </div>
+              ))}
+              <div className="cls-row">
+                <input
+                  className="f-input cls-label"
+                  value={newOriginLabel}
+                  onChange={(e) => setNewOriginLabel(e.target.value)}
+                  placeholder="New origin/requestor…"
+                  onKeyDown={(e) => { if (e.key === "Enter") addOption(setOriginOptions, newOriginLabel, setNewOriginLabel); }}
+                />
+                <button className="ghost-btn sm" onClick={() => addOption(setOriginOptions, newOriginLabel, setNewOriginLabel)}>+ Add</button>
+              </div>
+
+              <label className="f-label">Discipline Classification</label>
+              {disciplineOptions.map((d) => (
+                <div key={d.key} className="cls-row">
+                  <input
+                    className="f-input cls-label"
+                    value={d.label}
+                    onChange={(e) => updateOption(setDisciplineOptions, d.key, { label: e.target.value })}
+                  />
+                  <label className="cls-flag">
+                    <input
+                      type="checkbox"
+                      checked={d.importantDefault}
+                      onChange={(e) => updateOption(setDisciplineOptions, d.key, { importantDefault: e.target.checked })}
+                    />
+                    important
+                  </label>
+                  <label className="cls-flag">
+                    <input
+                      type="checkbox"
+                      checked={d.dueToday}
+                      onChange={(e) => updateOption(setDisciplineOptions, d.key, { dueToday: e.target.checked })}
+                    />
+                    due today
+                  </label>
+                  <button className="danger-btn sm" onClick={() => deleteOption(setDisciplineOptions, d.key)}>Delete</button>
+                </div>
+              ))}
+              <div className="cls-row">
+                <input
+                  className="f-input cls-label"
+                  value={newDisciplineLabel}
+                  onChange={(e) => setNewDisciplineLabel(e.target.value)}
+                  placeholder="New discipline…"
+                  onKeyDown={(e) => { if (e.key === "Enter") addOption(setDisciplineOptions, newDisciplineLabel, setNewDisciplineLabel); }}
+                />
+                <button className="ghost-btn sm" onClick={() => addOption(setDisciplineOptions, newDisciplineLabel, setNewDisciplineLabel)}>+ Add</button>
+              </div>
+
+              <div className="m-actions">
+                <button className="ghost-btn" onClick={() => setSettingsOpen(false)}>Close</button>
+              </div>
+              <div className="m-hint">
+                Deleting an option in use by an existing project/task doesn't
+                break anything — it just renders as "Unspecified" from then on.
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* debug panel */}
       {debugOpen && (
@@ -2493,6 +2714,9 @@ export default function Orrery() {
             </button>
           )
         )}
+        <button className="ghost-btn sm" onClick={() => { if (!settingsOpen) rememberFocus(); setSettingsOpen((o) => !o); }} aria-label="Manage Origin/Requestor and Discipline Classification options">
+          🏷 classify
+        </button>
         <button className="ghost-btn sm" onClick={() => { if (!debugOpen) rememberFocus(); setDebugOpen((o) => !o); setDbgConfirmClear(false); }} aria-label="Toggle debug panel">
           ⚙ debug
         </button>
@@ -2533,9 +2757,9 @@ export default function Orrery() {
                 <label className="f-label" htmlFor="pdesc">Description (optional)</label>
                 <textarea id="pdesc" className="f-input" rows={2} value={fProjDesc} onChange={(e) => setFProjDesc(e.target.value)}
                   placeholder="What is this world?" />
-                <label className="f-label" htmlFor="parch">Work type</label>
-                <select id="parch" className="f-input" value={fProjArch} onChange={(e) => setFProjArch(e.target.value)}>
-                  {ARCHETYPES.map((a) => <option key={a.key} value={a.key}>{a.label}</option>)}
+                <label className="f-label" htmlFor="porigin">Origin/Requestor</label>
+                <select id="porigin" className="f-input" value={fProjOrigin} onChange={(e) => setFProjOrigin(e.target.value)}>
+                  {originOptions.map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
                 </select>
                 <div className="m-actions">
                   <button className="primary-btn" disabled={!fProjName.trim()} onClick={addProject}>
@@ -2551,6 +2775,11 @@ export default function Orrery() {
                 <select id="tproj" className="f-input" value={fTaskProject} onChange={(e) => setFTaskProject(e.target.value)}>
                   <option value="" disabled>Select a world…</option>
                   {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                </select>
+                <label className="f-label" htmlFor="tdiscipline">Discipline Classification</label>
+                <select id="tdiscipline" className="f-input" value={fTaskDiscipline} onChange={(e) => setFTaskDiscipline(e.target.value)}>
+                  <option value={UNSET_DISCIPLINE.key} disabled>Select a discipline…</option>
+                  {disciplineOptions.map((d) => <option key={d.key} value={d.key}>{d.label}</option>)}
                 </select>
                 <label className="f-label" htmlFor="ttitle">Task title</label>
                 <input id="ttitle" className="f-input" value={fTaskTitle} onChange={(e) => setFTaskTitle(e.target.value)}
@@ -2647,6 +2876,7 @@ const css = `
 }
 .ph-name { font-family: 'Cormorant Garamond', serif; font-size: 26px; font-weight: 600; }
 .ph-desc { color: var(--ink-dim); font-size: 13px; margin-top: 2px; }
+.ph-origin { color: var(--ink-dim); font-size: 11.5px; letter-spacing: 0.04em; margin-top: 4px; opacity: 0.85; }
 .ph-meta { font-size: 13px; color: var(--ink-dim); margin-top: 6px; }
 .complete-tag { color: var(--accent); }
 .bar { height: 3px; background: rgba(150,175,255,0.14); border-radius: 2px; margin: 8px auto 0; width: 70%; }
@@ -2803,6 +3033,14 @@ const css = `
 .f-input:focus { border-color: rgba(170,195,255,0.55); box-shadow: 0 0 0 3px rgba(130,160,255,0.12); }
 .m-actions { display: flex; gap: 10px; margin-top: 16px; }
 .m-hint { font-size: 12px; color: var(--ink-dim); margin-top: 12px; line-height: 1.5; }
+
+.cls-row { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+.cls-label { flex: 1; padding: 7px 10px; font-size: 13px; }
+.cls-flag {
+  display: flex; gap: 5px; align-items: center; flex-shrink: 0;
+  font-size: 11px; color: var(--ink-dim); cursor: pointer; white-space: nowrap;
+}
+.cls-flag input { accent-color: var(--accent); cursor: pointer; }
 
 .loading { left: 50%; bottom: 26px; transform: translateX(-50%); color: var(--ink-dim); font-size: 13px; }
 

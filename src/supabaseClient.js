@@ -11,9 +11,13 @@ const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
 export const supabase = url && anonKey ? createClient(url, anonKey) : null;
 
-// Returns the saved projects array, or null if this user has no row yet
-// (first-time sync) or the client isn't configured.
-export async function loadCloudProjects(userId) {
+// Returns whatever raw JSON value is stored in this user's row, or null if
+// they have no row yet (first-time sync) or the client isn't configured.
+// This is a dumb transport layer — it doesn't know or care about the app's
+// state shape (bare projects array vs. the richer {projects, originOptions,
+// disciplineOptions} object); Orrery.jsx's normalizeCloudState is what
+// interprets whichever shape comes back.
+export async function loadCloudState(userId) {
   if (!supabase) return null;
   const { data, error } = await supabase
     .from("galaxies")
@@ -24,10 +28,14 @@ export async function loadCloudProjects(userId) {
   return data ? data.projects : null;
 }
 
-export async function saveCloudProjects(userId, projects) {
+// `state` is the whole app-state object (or, historically, a bare projects
+// array) — the DB column is still literally named `projects` for backwards
+// compatibility, but it now holds the full {projects, originOptions,
+// disciplineOptions} object rather than just the projects array.
+export async function saveCloudState(userId, state) {
   if (!supabase) return;
   const { error } = await supabase
     .from("galaxies")
-    .upsert({ user_id: userId, projects, updated_at: new Date().toISOString() });
+    .upsert({ user_id: userId, projects: state, updated_at: new Date().toISOString() });
   if (error) throw error;
 }
